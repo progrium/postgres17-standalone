@@ -31,3 +31,14 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+.DS_Store
+
+
+/.local
+/dist
+/root.tar
+/root.tar.br
+/assets/root.tar.br
+/assets/bzImage
+/data
+/postgres17-standalone

@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>v86 9P netboot</title>
+<script src="/assets/libv86.js"></script>
+<div id="screen_container">
+  <div style="white-space:pre;font:14px monospace;line-height:14px"></div>
+  <canvas style="display:none"></canvas>
+</div>
+<script>
+const hostname = location.host
+const RELAY = `ws://${hostname}/ethernet`;  
+const params = new URLSearchParams(location.search);
+// kernel cmdline values can't contain double quotes, so strip them
+const kenv = (key, def) => `${key}="${(params.get(key) ?? def).replaceAll('"', "")}"`;
+const tty = new WebSocket(`ws://${hostname}/tty`);
+tty.binaryType = "arraybuffer";
+
+window.emulator = new V86({
+  wasm_path: "/assets/v86.wasm",
+  memory_size: 256 * 1024 * 1024,
+  vga_memory_size: 8 * 1024 * 1024,
+  // screen_container: document.getElementById("screen_container"),
+  bios: { url: "/assets/seabios.bin" },
+  vga_bios: { url: "/assets/vgabios.bin" },
+  bzimage: { url: "/assets/bzImage" },
+  net_device: { type: "virtio", relay_url: RELAY },
+  cmdline: [
+    "init=/bin/init",
+    "loglevel=3",
+    "console=hvc0",
+    "ip=10.0.0.10::10.0.0.1:255.255.255.0:v86:eth0:off",
+    "root=10.0.0.1",
+    "rootfstype=9p",
+    "rootflags=trans=tcp,port=3333,version=9p2000.L,msize=65536,cache=loose,aname=root",
+    "rw",
+    "P9_ADDR=10.0.0.1",
+    "P9_PORT=3333",
+    kenv("POSTGRES_DB", "postgres"),
+    kenv("POSTGRES_USER", "postgres"),
+    kenv("POSTGRES_PASSWORD", ""),
+    "START=\"/usr/local/bin/docker-entrypoint.sh postgres\""
+  ].join(" "),
+  virtio_console: true,
+  autostart: true,
+  disable_mouse: true,
+  disable_speaker: true,
+  disable_keyboard: false,
+});
+window.emulator.add_listener("virtio-console0-output-bytes", (buf) => {
+  tty.send(buf);
+});
+tty.onmessage = (event) => {
+  const buf = new Uint8Array(event.data);
+  window.emulator.bus.send("virtio-console0-input-bytes", buf);
+};
+</script>

@@ -1,0 +1,31 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+
+export LANG=en_US.utf8
+export PATH=/usr/local/bin:$PATH
+export PG_VERSION=17.11
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+mkdir -p /var/run/postgresql
+mount -t tmpfs tmpfs /var/run/postgresql
+
+ln -s /proc/self/fd /dev/fd
+
+echo nameserver 8.8.8.8 > /etc/resolv.conf
+
+export PGDATA=/var/lib/postgresql/data
+export POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
+
+mkdir -p $PGDATA /mnt/pgdata
+mount -t 9p \
+  -o trans=tcp,port=$P9_PORT,version=9p2000.L,msize=65536,cache=loose,aname=data,access=user \
+  $P9_ADDR /mnt/pgdata
+bindfs --force-user=postgres --force-group=postgres --perms=u+rwx \
+  /mnt/pgdata $PGDATA
+
+exec setsid -c ${START:-/bin/sh} -i <>/dev/hvc0 >&0 2>&1
