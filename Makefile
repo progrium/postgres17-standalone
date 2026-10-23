@@ -27,16 +27,21 @@ assets/bzImage:
 	docker rm -f kernel-export
 
 DIST_ASSETS 	:= $(DIST_DIR)/postgres17-standalone
-DIST_TARGETS	:= $(foreach os, $(DIST_OS), $(foreach arch, $(DIST_ARCH), $(DIST_DIR)/$(NAME)_$(VERSION)_$(os)_$(arch)))
+DIST_TARGETS	:= $(foreach os, $(DIST_OS), $(foreach arch, $(DIST_ARCH), $(DIST_DIR)/$(NAME)_$(VERSION)_$(os)_$(arch).zip))
 
-## Build distribution binaries
+## Build distribution zips
 dist: $(DIST_TARGETS)
 .PHONY: dist
 
-$(DIST_TARGETS): $(DIST_DIR)/%:
-	GOOS=$(word 3, $(subst _, ,$@)) \
-	GOARCH=$(word 4, $(subst _, ,$@)) \
-	go build -ldflags="-X main.Version=$(VERSION)" $(GOARGS) -o $@ .
+$(DIST_TARGETS): $(DIST_DIR)/%.zip:
+	$(eval DIST_GOOS := $(word 3, $(subst _, ,$*)))
+	$(eval DIST_BIN := $(DIST_DIR)/$*/$(NAME)$(if $(filter windows,$(DIST_GOOS)),.exe))
+	GOOS=$(DIST_GOOS) \
+	GOARCH=$(word 4, $(subst _, ,$*)) \
+	go build -ldflags="-X main.Version=$(VERSION)" $(GOARGS) -o $(DIST_BIN) .
+	rm -f $@
+	zip -j $@ $(DIST_BIN)
+	rm -rf $(DIST_DIR)/$*
 
 .DEFAULT_GOAL := show-help
 

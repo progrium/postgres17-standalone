@@ -170,13 +170,9 @@ func main() {
 	}()
 
 	<-ready
-	u := launcher.New().
-		Headless(true).
-		MustLaunch()
-
+	u := launcher.New().Headless(true).MustLaunch()
 	browser := rod.New().ControlURL(u).MustConnect()
 	defer browser.MustClose()
-	// Open Wikipedia and wait for it to finish loading.
 	query := url.Values{}
 	query.Set("9p", p9l.Addr().String())
 	query.Set("POSTGRES_DB", pgDB)
@@ -184,9 +180,6 @@ func main() {
 	query.Set("POSTGRES_PASSWORD", pgPassword)
 	page := browser.MustPage(fmt.Sprintf("http://%s/?%s", l.Addr().String(), query.Encode()))
 	page.MustWaitLoad()
-
-	// fmt.Printf("Loaded: %s (%s)\n", page.MustInfo().Title, page.MustInfo().URL)
-	// fmt.Println("Page is open in the background. Press Ctrl+C to quit.")
 
 	// Keep the page open until interrupted.
 	sig := make(chan os.Signal, 1)
@@ -211,7 +204,7 @@ func forwardPort(vn *vnet.VirtualNetwork, localAddr, remoteAddr string) {
 	}
 	defer listener.Close()
 
-	fmt.Printf("Forwarding traffic from %s to %s\n", localAddr, remoteAddr)
+	fmt.Printf("Forwarding traffic from %s to browser container %s\n", localAddr, remoteAddr)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
