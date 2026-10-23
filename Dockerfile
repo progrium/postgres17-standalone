@@ -1,8 +1,7 @@
 ARG LINUX_386=linux/386
 
 FROM --platform=$LINUX_386 postgres:17-alpine AS postgres-root
-RUN echo "https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories && \
-    apk add -u bindfs
+RUN apk add -u e2fsprogs
 
 FROM alpine:latest AS postgres-compress
 RUN apk add --no-cache brotli

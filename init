@@ -21,11 +21,48 @@ echo nameserver 8.8.8.8 > /etc/resolv.conf
 export PGDATA=/var/lib/postgresql/data
 export POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
 
-mkdir -p $PGDATA /mnt/pgdata
+# Host folder that holds pgdata.img. cache=none: the guest page cache
+# already sits above ext4, so don't cache again underneath the loop device.
+mkdir -p /mnt/host
 mount -t 9p \
-  -o trans=tcp,port=$P9_PORT,version=9p2000.L,msize=65536,cache=loose,aname=data,access=user \
-  $P9_ADDR /mnt/pgdata
-bindfs --force-user=postgres --force-group=postgres --perms=u+rwx \
-  /mnt/pgdata $PGDATA
+  -o trans=tcp,port=$P9_PORT,version=9p2000.L,msize=262144,cache=none,aname=data \
+  $P9_ADDR /mnt/host
 
-exec setsid -c ${START:-/bin/sh} -i <>/dev/hvc0 >&0 2>&1
+IMG=/mnt/host/pgdata.img
+DEV=/dev/loop0
+SIZE=${PGDATA_SIZE:-10G}
+
+# Size the backing file BEFORE attaching: loop reads the size at attach time.
+# Sparse, so a fresh 10G image uses almost no host disk.
+[ -s $IMG ] || truncate -s $SIZE $IMG
+
+[ -b $DEV ] || mknod $DEV b 7 0
+losetup $DEV $IMG || { echo "init: losetup failed"; exec sh; }
+
+if [ "$(cat /sys/block/loop0/size)" = 0 ]; then
+  echo "init: $IMG has size 0 over 9P"; exec sh
+fi
+
+# Format only on first boot.
+if ! blkid $DEV | grep -q 'TYPE="ext4"'; then
+  mkfs.ext4 -q -L pgdata -i 65536 -J size=64 -E nodiscard $DEV
+fi
+
+mkdir -p /var/lib/postgresql
+mount -t ext4 -o noatime,noinit_itable $DEV /var/lib/postgresql
+
+mkdir -p $PGDATA
+chown postgres:postgres /var/lib/postgresql $PGDATA
+chmod 700 $PGDATA
+
+exec setsid -c ${START:-/bin/sh} -i <>/dev/hvc0 >&0 2>&1 &
+PG=$!
+trap 'kill -INT $PG 2>/dev/null' TERM INT
+while kill -0 $PG 2>/dev/null; do wait $PG; done
+
+set -x
+umount /var/lib/postgresql
+losetup -d $DEV
+sync
+echo "Powering off... Ctrl+D to detach"
+poweroff -f

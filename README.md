@@ -7,17 +7,18 @@ You don't need Docker or a local Postgres install. You do need Chrome or Chromiu
 ## Usage
 
 ```sh
-POSTGRES_PASSWORD=secret postgres17-standalone [-p port] <dataDir>
+POSTGRES_PASSWORD=secret postgres17-standalone [-p port] [-shell] <dataDir>
 ```
 
 - `dataDir` (required): the host directory used as Postgres's data directory. It is created if it doesn't exist.
 - `-p`: the host port to listen on, on all interfaces. Defaults to `5432`.
+- `-shell`: start a shell in the VM instead of the Postgres entrypoint.
 
 Environment variables:
 
 | Variable            | Required | Default    |
 |---------------------|----------|------------|
-| `POSTGRES_PASSWORD` | yes      |            |
+| `POSTGRES_PASSWORD` | yes (not with `-shell`) |            |
 | `POSTGRES_USER`     | no       | `postgres` |
 | `POSTGRES_DB`       | no       | `postgres` |
 

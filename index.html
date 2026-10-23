@@ -38,7 +38,8 @@ window.emulator = new V86({
     kenv("POSTGRES_DB", "postgres"),
     kenv("POSTGRES_USER", "postgres"),
     kenv("POSTGRES_PASSWORD", ""),
-    "START=\"/usr/local/bin/docker-entrypoint.sh postgres\""
+    // without START, init falls back to /bin/sh
+    ...(params.has("shell") ? [] : ["START=\"/usr/local/bin/docker-entrypoint.sh postgres\""]),
   ].join(" "),
   virtio_console: true,
   autostart: true,
@@ -50,6 +51,10 @@ window.emulator.add_listener("virtio-console0-output-bytes", (buf) => {
   tty.send(buf);
 });
 tty.onmessage = (event) => {
+  if (typeof event.data === "string") {
+    window.emulator.bus.send("virtio-console0-resize", JSON.parse(event.data));
+    return;
+  }
   const buf = new Uint8Array(event.data);
   window.emulator.bus.send("virtio-console0-input-bytes", buf);
 };

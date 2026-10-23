@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,8 +45,10 @@ var embedFS embed.FS
 
 func main() {
 	port := flag.Int("p", 5432, "host port to listen on and forward to postgres")
+	shell := flag.Bool("shell", false, "start a shell instead of the postgres entrypoint")
+	debug := flag.Bool("debug", false, "run in debug mode, disables headless browser mode")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-p port] <dataDir>\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-p port] [-shell] <dataDir>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -61,10 +64,25 @@ func main() {
 		log.Fatal(err)
 	}
 
+	img := filepath.Join(dataDir, "pgdata.img")
+	lock, err := lockImage(img)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer lock.Close()
+
+	n, err := parseSize("10G")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := ensureImage(img, n); err != nil {
+		log.Fatal(err)
+	}
+
 	pgDB := envOr("POSTGRES_DB", "postgres")
 	pgUser := envOr("POSTGRES_USER", "postgres")
 	pgPassword := os.Getenv("POSTGRES_PASSWORD")
-	if pgPassword == "" {
+	if pgPassword == "" && !*shell {
 		log.Fatal("POSTGRES_PASSWORD environment variable is required")
 	}
 
@@ -170,7 +188,7 @@ func main() {
 	}()
 
 	<-ready
-	u := launcher.New().Headless(true).MustLaunch()
+	u := launcher.New().Headless(!*debug).MustLaunch()
 	browser := rod.New().ControlURL(u).MustConnect()
 	defer browser.MustClose()
 	query := url.Values{}
@@ -178,6 +196,9 @@ func main() {
 	query.Set("POSTGRES_DB", pgDB)
 	query.Set("POSTGRES_USER", pgUser)
 	query.Set("POSTGRES_PASSWORD", pgPassword)
+	if *shell {
+		query.Set("shell", "1")
+	}
 	page := browser.MustPage(fmt.Sprintf("http://%s/?%s", l.Addr().String(), query.Encode()))
 	page.MustWaitLoad()
 
@@ -348,6 +369,19 @@ func handleTTY(ch *xws.Conn) {
 
 	go io.Copy(os.Stdout, ch)
 
+	// resize messages go as text frames; console bytes stay binary
+	sendSize := func() {
+		cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
+		if err != nil {
+			return
+		}
+		if err := xws.JSON.Send(ch, [2]int{rows, cols}); err != nil {
+			log.Println(err)
+		}
+	}
+	sendSize()
+	go watchResize(sendSize)
+
 	buffer := make([]byte, 1024)
 	for {
 		n, err := os.Stdin.Read(buffer)
@@ -412,4 +446,50 @@ func decompressRootToCache() (string, error) {
 		return "", err
 	}
 	return cachedRoot, os.Rename(tmp.Name(), cachedRoot)
+}
+
+// ensureImage creates path as a sparse file of the given size.
+// An existing non-empty image is left untouched; ext4 inside it
+// can't grow without resize2fs, so a larger size is ignored.
+// Call it only while holding the lock from lockImage.
+func ensureImage(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() > 0 {
+		return nil // existing image
+	}
+
+	// New (or left empty by an earlier failed run): mark sparse, then extend.
+	if err := makeSparse(f); err != nil {
+		return fmt.Errorf("marking %s sparse: %w", path, err)
+	}
+	if err := f.Truncate(size); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// parseSize accepts plain bytes or a K/M/G/T suffix: "32G", "512M".
+func parseSize(s string) (int64, error) {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	mult := int64(1)
+	for suffix, m := range map[string]int64{"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40} {
+		if strings.HasSuffix(s, suffix) {
+			mult, s = m, strings.TrimSuffix(s, suffix)
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return n * mult, nil
 }
