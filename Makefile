@@ -13,18 +13,10 @@ assets: assets/root.tar.br assets/bzImage
 .PHONY: assets
 
 assets/root.tar.br:
-	docker build --platform=linux/386 --target postgres -t postgres-build .
-	docker rm -f postgres-export > /dev/null 2>&1 || true 
-	docker create --name postgres-export postgres-build
-	docker cp postgres-export:/root.tar.br ./assets/root.tar.br
-	docker rm -f postgres-export
+	docker build --target postgres-export --output type=local,dest=./assets .
 
 assets/bzImage:
-	docker build --target=kernel -t postgres-kernel .
-	docker rm -f kernel-export > /dev/null 2>&1 || true 
-	docker create --name kernel-export postgres-kernel
-	docker cp kernel-export:/build/arch/x86/boot/bzImage ./assets/bzImage
-	docker rm -f kernel-export
+	docker build --target kernel-export --output type=local,dest=./assets .
 
 DIST_ASSETS 	:= $(DIST_DIR)/postgres17-standalone
 DIST_TARGETS	:= $(foreach os, $(DIST_OS), $(foreach arch, $(DIST_ARCH), $(DIST_DIR)/$(NAME)_$(VERSION)_$(os)_$(arch).zip))
