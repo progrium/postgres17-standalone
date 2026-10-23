@@ -202,7 +202,7 @@ func run() int {
 	mux.Handle("/", http.FileServer(http.FS(embedFS)))
 	detach := make(chan struct{})
 	var detachOnce sync.Once
-	mux.Handle("/tty", xws.Handler(func(c *xws.Conn) {
+	mux.Handle("/console", xws.Handler(func(c *xws.Conn) {
 		handleTTY(c, *debug, func() { detachOnce.Do(func() { close(detach) }) })
 	}))
 	mux.Handle("/ethernet", ethernetHandler(vn))

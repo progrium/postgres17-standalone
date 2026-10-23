@@ -13,7 +13,7 @@ const auth = `token=${encodeURIComponent(params.get("token") ?? "")}`;
 const RELAY = `ws://${hostname}/ethernet?${auth}`;
 // kernel cmdline values can't contain double quotes, so strip them
 const kenv = (key, def) => `${key}="${(params.get(key) ?? def).replaceAll('"', "")}"`;
-const tty = new WebSocket(`ws://${hostname}/tty?${auth}`);
+const tty = new WebSocket(`ws://${hostname}/console?${auth}`);
 tty.binaryType = "arraybuffer";
 
 window.emulator = new V86({

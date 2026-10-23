@@ -1,5 +1,5 @@
 NAME			?= postgres17-standalone
-VERSION 		?= v0.1
+VERSION 		?= v0.2
 GOARGS			?=
 GOOS			?= $(shell go env GOOS)
 GOARCH			?= $(shell go env GOARCH)
