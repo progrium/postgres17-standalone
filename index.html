@@ -36,11 +36,12 @@ window.emulator = new V86({
     "rw",
     "P9_ADDR=10.0.0.1",
     "P9_PORT=3333",
+    "CTL_PORT=3334",
     kenv("POSTGRES_DB", "postgres"),
     kenv("POSTGRES_USER", "postgres"),
     kenv("POSTGRES_PASSWORD", ""),
     // without START, init falls back to /bin/sh
-    ...(params.has("shell") ? [] : ["START=\"/usr/local/bin/docker-entrypoint.sh postgres\""]),
+    ...(params.has("debug") ? [] : ["START=\"/usr/local/bin/docker-entrypoint.sh postgres\""]),
   ].join(" "),
   virtio_console: true,
   autostart: true,

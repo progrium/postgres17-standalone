@@ -55,14 +55,31 @@ mkdir -p $PGDATA
 chown postgres:postgres /var/lib/postgresql $PGDATA
 chmod 700 $PGDATA
 
-exec setsid -c ${START:-/bin/sh} -i <>/dev/hvc0 >&0 2>&1 &
+setsid -c ${START:-/bin/sh} -i <>/dev/hvc0 >&0 2>&1 &
 PG=$!
-trap 'kill -INT $PG 2>/dev/null' TERM INT
-while kill -0 $PG 2>/dev/null; do wait $PG; done
 
-set -x
+# Control channel to the host: it sends "stop" to request a clean
+# shutdown. INT is a Postgres fast shutdown; HUP covers the debug shell,
+# which ignores INT. The fifo carries our reply back on the same socket.
+CTL=/run/ctl
+mkdir -p /run
+mount -t tmpfs tmpfs /run
+mkfifo $CTL
+exec 3<>$CTL
+(nc $P9_ADDR $CTL_PORT <$CTL | while read -r cmd; do
+  if [ "$cmd" = stop ]; then
+    kill -INT $PG 2>/dev/null
+    kill -HUP $PG 2>/dev/null
+  fi
+done) &
+
+wait $PG
+RC=$?
+
 umount /var/lib/postgresql
 losetup -d $DEV
 sync
-echo "Powering off... Ctrl+D to detach"
+echo "halted $RC" >&3
+# give the host a moment to read it before the VM disappears
+sleep 1
 poweroff -f

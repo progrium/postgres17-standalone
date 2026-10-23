@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -47,11 +49,16 @@ var Version string
 var embedFS embed.FS
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	defer restoreTerminal()
+
 	port := flag.Int("p", 5432, "host port to listen on and forward to postgres")
-	shell := flag.Bool("shell", false, "start a shell instead of the postgres entrypoint")
-	debug := flag.Bool("debug", false, "run in debug mode, disables headless browser mode")
+	debug := flag.Bool("debug", false, "show the browser and boot to a shell; Ctrl+C goes to the guest, Ctrl+D detaches")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-p port] [-shell] <dataDir>\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-p port] [-debug] <dataDir>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -85,7 +92,7 @@ func main() {
 	pgDB := envOr("POSTGRES_DB", "postgres")
 	pgUser := envOr("POSTGRES_USER", "postgres")
 	pgPassword := os.Getenv("POSTGRES_PASSWORD")
-	if pgPassword == "" && !*shell {
+	if pgPassword == "" && !*debug {
 		log.Fatal("POSTGRES_PASSWORD environment variable is required")
 	}
 
@@ -113,6 +120,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("err binding: %v", err)
 	}
+	ctlL, err := vn.Listen("tcp", "10.0.0.1:3334")
+	if err != nil {
+		log.Fatalf("err binding: %v", err)
+	}
+	ctl := newGuestControl(ctlL)
 
 	var ready chan bool = make(chan bool)
 	go func() {
@@ -187,13 +199,20 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(embedFS)))
-	mux.Handle("/tty", xws.Handler(handleTTY))
+	detach := make(chan struct{})
+	var detachOnce sync.Once
+	mux.Handle("/tty", xws.Handler(func(c *xws.Conn) {
+		handleTTY(c, *debug, func() { detachOnce.Do(func() { close(detach) }) })
+	}))
 	mux.Handle("/ethernet", ethernetHandler(vn))
 	go func() {
 		if err := http.Serve(l, requireToken(token, mux)); err != nil {
 			log.Fatal(err)
 		}
 	}()
+
+	sig := make(chan os.Signal, 2)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
 	<-ready
 	u := launcher.New().Headless(!*debug).MustLaunch()
@@ -205,18 +224,138 @@ func main() {
 	query.Set("POSTGRES_DB", pgDB)
 	query.Set("POSTGRES_USER", pgUser)
 	query.Set("POSTGRES_PASSWORD", pgPassword)
-	if *shell {
-		query.Set("shell", "1")
+	if *debug {
+		query.Set("debug", "1")
 	}
 	page := browser.MustPage(fmt.Sprintf("http://%s/?%s", l.Addr().String(), query.Encode()))
 	page.MustWaitLoad()
 
-	// Keep the page open until interrupted.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
+	select {
+	case rc := <-ctl.halted:
+		// guest exited on its own (postgres died, or the debug shell exited)
+		return rc
+	case <-sig:
+	case <-detach:
+	}
+	return shutdown(ctl, sig)
+}
 
-	fmt.Println("\nShutting down...")
+const shutdownTimeout = 30 * time.Second
+
+// shutdown asks the guest to stop and waits until it reports the data
+// image is unmounted and synced. A second signal forces an exit.
+func shutdown(ctl *guestControl, sig <-chan os.Signal) int {
+	restoreTerminal()
+	fmt.Fprintln(os.Stderr, "\nShutting down... (Ctrl+C again to force)")
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	go func() {
+		if err := ctl.stop(ctx); err != nil && ctx.Err() == nil {
+			log.Println("stopping guest:", err)
+		}
+	}()
+
+	select {
+	case <-ctl.halted:
+		return 0
+	case <-sig:
+		fmt.Fprintln(os.Stderr, "Forced exit; data image may need recovery on next start")
+	case <-ctx.Done():
+		fmt.Fprintln(os.Stderr, "Timed out waiting for guest to shut down")
+	}
+	return 1
+}
+
+// guestControl is the host end of init's control connection. The host
+// sends "stop" to request a clean shutdown; init replies "halted <rc>"
+// once the data image is unmounted and synced, right before poweroff.
+type guestControl struct {
+	mu        sync.Mutex
+	conn      net.Conn
+	connected chan struct{}
+	halted    chan int
+}
+
+func newGuestControl(l net.Listener) *guestControl {
+	g := &guestControl{connected: make(chan struct{}), halted: make(chan int, 1)}
+	go g.serve(l)
+	return g
+}
+
+func (g *guestControl) serve(l net.Listener) {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		g.mu.Lock()
+		first := g.conn == nil
+		g.conn = conn
+		g.mu.Unlock()
+		if first {
+			close(g.connected)
+		}
+		go g.read(conn)
+	}
+}
+
+func (g *guestControl) read(conn net.Conn) {
+	sc := bufio.NewScanner(conn)
+	for sc.Scan() {
+		var rc int
+		if _, err := fmt.Sscanf(sc.Text(), "halted %d", &rc); err == nil {
+			// closing lets init's nc exit, telling init the message landed
+			conn.Close()
+			select {
+			case g.halted <- rc:
+			default:
+			}
+			return
+		}
+	}
+}
+
+// stop waits for the guest to connect (it may still be booting), then
+// sends the stop request.
+func (g *guestControl) stop(ctx context.Context) error {
+	select {
+	case <-g.connected:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	g.mu.Lock()
+	conn := g.conn
+	g.mu.Unlock()
+	_, err := io.WriteString(conn, "stop\n")
+	return err
+}
+
+var rawTerm struct {
+	sync.Mutex
+	fd    int
+	state *term.State
+}
+
+func makeRaw(fd int) error {
+	rawTerm.Lock()
+	defer rawTerm.Unlock()
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return err
+	}
+	rawTerm.fd, rawTerm.state = fd, state
+	return nil
+}
+
+func restoreTerminal() {
+	rawTerm.Lock()
+	defer rawTerm.Unlock()
+	if rawTerm.state != nil {
+		term.Restore(rawTerm.fd, rawTerm.state)
+		rawTerm.state = nil
+	}
 }
 
 const (
@@ -410,14 +549,28 @@ func (c *qemuAdapter) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func handleTTY(ch *xws.Conn) {
+// handleTTY streams the guest console to stdout. Only in debug mode on a
+// real terminal is stdin forwarded in raw mode (so Ctrl+C reaches the
+// guest); there Ctrl+D detaches. Otherwise Ctrl+C is a normal signal.
+func handleTTY(ch *xws.Conn, debug bool, detach func()) {
 	ch.PayloadType = xws.BinaryFrame
-	oldstate, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	go io.Copy(os.Stdout, ch)
+	done := make(chan struct{})
+	go func() {
+		io.Copy(os.Stdout, ch)
+		close(done)
+	}()
+
+	fd := int(os.Stdin.Fd())
+	if !debug || !term.IsTerminal(fd) {
+		<-done
+		return
+	}
+	if err := makeRaw(fd); err != nil {
+		log.Println(err)
+		<-done
+		return
+	}
 
 	// resize messages go as text frames; console bytes stay binary
 	sendSize := func() {
@@ -436,25 +589,22 @@ func handleTTY(ch *xws.Conn) {
 	for {
 		n, err := os.Stdin.Read(buffer)
 		if err != nil {
-			term.Restore(int(os.Stdin.Fd()), oldstate)
-			log.Fatal("Error reading from stdin:", err)
+			break
 		}
-
-		for i := 0; i < n; i++ {
-			// Check for Ctrl-D (ASCII 4)
-			if buffer[i] == 4 {
-				term.Restore(int(os.Stdin.Fd()), oldstate)
-				ch.Close()
-				os.Exit(0) // Exit the program on Ctrl-D
-				return
+		// Ctrl+D (EOT) detaches
+		if i := bytes.IndexByte(buffer[:n], 4); i >= 0 {
+			if i > 0 {
+				ch.Write(buffer[:i])
 			}
+			break
 		}
-
-		_, err = ch.Write(buffer[:n])
-		if err != nil {
+		if _, err := ch.Write(buffer[:n]); err != nil {
 			log.Println(err)
 		}
 	}
+	detach()
+	// keep showing guest output while it shuts down
+	<-done
 }
 
 // decompressRootToCache decompresses a .br file into <user cache dir>/<app>/

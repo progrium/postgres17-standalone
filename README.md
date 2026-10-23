@@ -7,22 +7,22 @@ You don't need Docker or a local Postgres install. You do need Chrome or Chromiu
 ## Usage
 
 ```sh
-POSTGRES_PASSWORD=secret postgres17-standalone [-p port] [-shell] <dataDir>
+POSTGRES_PASSWORD=secret postgres17-standalone [-p port] [-debug] <dataDir>
 ```
 
 - `dataDir` (required): the host directory used as Postgres's data directory. It is created if it doesn't exist.
 - `-p`: the host port to listen on, on all interfaces. Defaults to `5432`.
-- `-shell`: start a shell in the VM instead of the Postgres entrypoint.
+- `-debug`: show the browser window and start a shell in the VM instead of Postgres. Your terminal is attached to the VM console in raw mode, so Ctrl-C goes to the guest; press Ctrl-D to shut down.
 
 Environment variables:
 
 | Variable            | Required | Default    |
 |---------------------|----------|------------|
-| `POSTGRES_PASSWORD` | yes (not with `-shell`) |            |
+| `POSTGRES_PASSWORD` | yes (not with `-debug`) |            |
 | `POSTGRES_USER`     | no       | `postgres` |
 | `POSTGRES_DB`       | no       | `postgres` |
 
-The VM console is attached to your terminal. Press Ctrl-D to exit.
+The VM console output is streamed to stdout. Press Ctrl-C (or send SIGTERM) to shut down cleanly: Postgres does a fast shutdown and the data image is unmounted before exit. Press Ctrl-C again to force an immediate exit.
 
 ```sh
 psql -h localhost -U postgres
