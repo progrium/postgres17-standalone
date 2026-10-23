@@ -21,6 +21,9 @@ Environment variables:
 | `POSTGRES_PASSWORD` | yes (not with `-debug`) |            |
 | `POSTGRES_USER`     | no       | `postgres` |
 | `POSTGRES_DB`       | no       | `postgres` |
+| `POSTGRES17_STANDALONE_CACHE_DIR` | no | `<user cache dir>/postgres17-standalone` |
+
+On first run the root image is decompressed into the cache dir. The cached file is named after a hash of the embedded image, so a new version unpacks a fresh copy and deletes the old one.
 
 The VM console output is streamed to stdout. Press Ctrl-C (or send SIGTERM) to shut down cleanly: Postgres does a fast shutdown and the data image is unmounted before exit. Press Ctrl-C again to force an immediate exit.
 

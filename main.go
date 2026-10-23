@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/binary"
@@ -607,29 +608,55 @@ func handleTTY(ch *xws.Conn, debug bool, detach func()) {
 	<-done
 }
 
-// decompressRootToCache decompresses a .br file into <user cache dir>/<app>/
-// and returns the path of the decompressed file.
-func decompressRootToCache() (string, error) {
-	cacheDir, err := os.UserCacheDir()
+const cacheDirEnv = "POSTGRES17_STANDALONE_CACHE_DIR"
+
+// cacheDir returns $POSTGRES17_STANDALONE_CACHE_DIR if set, otherwise
+// <user cache dir>/postgres17-standalone.
+func cacheDir() (string, error) {
+	if dir := os.Getenv(cacheDirEnv); dir != "" {
+		return filepath.Abs(dir)
+	}
+	dir, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(cacheDir, "postgres17-standalone")
+	return filepath.Join(dir, "postgres17-standalone"), nil
+}
+
+// decompressRootToCache decompresses the embedded root.tar.br into the
+// cache dir and returns the path of the decompressed file. The file name
+// includes a hash of the embedded archive, so a binary with a different
+// root image never reuses a stale cache entry.
+func decompressRootToCache() (string, error) {
+	dir, err := cacheDir()
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	cachedRoot := filepath.Join(dir, "root.tar")
-	if _, err := os.Stat(cachedRoot); err == nil {
-		return cachedRoot, nil
-	}
-
-	fmt.Println("Decompressing root image to cache...")
 
 	src, err := embedFS.Open("assets/root.tar.br")
 	if err != nil {
 		return "", err
 	}
 	defer src.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, src); err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf("root-%x.tar", h.Sum(nil)[:8])
+	cachedRoot := filepath.Join(dir, name)
+	if _, err := os.Stat(cachedRoot); err == nil {
+		return cachedRoot, nil
+	}
+
+	fmt.Println("Decompressing root image to cache...")
+
+	if _, err := src.(io.Seeker).Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
 
 	// Write to a temp file, then rename, so a failed run never leaves a partial file.
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
@@ -645,7 +672,19 @@ func decompressRootToCache() (string, error) {
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
-	return cachedRoot, os.Rename(tmp.Name(), cachedRoot)
+	if err := os.Rename(tmp.Name(), cachedRoot); err != nil {
+		return "", err
+	}
+
+	// Best effort: drop roots from other versions. Fails harmlessly on
+	// Windows if another instance still has one open.
+	old, _ := filepath.Glob(filepath.Join(dir, "root*.tar"))
+	for _, f := range old {
+		if filepath.Base(f) != name {
+			os.Remove(f)
+		}
+	}
+	return cachedRoot, nil
 }
 
 // ensureImage creates path as a sparse file of the given size.
