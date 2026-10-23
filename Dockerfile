@@ -9,10 +9,6 @@ RUN apk add --no-cache brotli
 COPY --from=postgres-root / /root/
 RUN tar -C /root -cf /root.tar . && brotli -j /root.tar
 
-FROM alpine:latest AS v86
-RUN wget -O /libv86.js https://cdn.jsdelivr.net/npm/v86/build/libv86.js
-RUN wget -O /v86.wasm https://cdn.jsdelivr.net/npm/v86/build/v86.wasm
-
 FROM ghcr.io/progrium/linux-build:latest AS kernel
 COPY kernel.config .config
 RUN make ARCH=i386 CROSS_COMPILE=i686-linux-gnu- oldconfig < /dev/null && \
