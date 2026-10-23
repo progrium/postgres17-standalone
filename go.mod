@@ -4,20 +4,18 @@ go 1.26.0
 
 replace github.com/hugelgupf/p9 => github.com/progrium/p9 v0.0.0-20251108235831-1c1dfeb38c1e
 
-//replace tractor.dev/wanix => ../../tractordev/wanix
-
 require (
+	github.com/andybalholm/brotli v1.2.6
 	github.com/go-rod/rod v0.116.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/hugelgupf/p9 v0.3.1-0.20240118043522-6f4f11e5296e
 	github.com/progrium/go-netstack v0.0.0-20260307051045-c26b546d338c
 	golang.org/x/net v0.55.0
 	golang.org/x/term v0.47.0
-	tractor.dev/wanix v0.0.0-20261020212432-af7fd3834316
+	tractor.dev/wanix v0.0.0-20261023035327-fdc5297ae8fa
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.6 // indirect
 	github.com/apparentlymart/go-cidr v1.1.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
@@ -36,4 +34,5 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
+	tractor.dev/toolkit-go v0.0.0-20250103001615-9a6753936c19 // indirect
 )
