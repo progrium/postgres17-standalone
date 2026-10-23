@@ -8,6 +8,11 @@ DIST_OS			?= darwin windows linux
 DIST_ARCH		?= arm64 amd64
 
 
+## Build binary
+build: assets
+	go build -ldflags="-X main.Version=$(VERSION)" $(GOARGS) . 
+.PHONY: build
+
 ## Build assets
 assets: assets/root.tar.br assets/bzImage
 .PHONY: assets
