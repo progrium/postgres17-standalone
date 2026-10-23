@@ -3,8 +3,11 @@ package main
 import (
 	"archive/tar"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -178,11 +181,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	http.Handle("/", http.FileServer(http.FS(embedFS)))
-	http.Handle("/tty", xws.Handler(handleTTY))
-	http.Handle("/ethernet", ethernetHandler(vn))
+	token, err := newToken()
+	if err != nil {
+		log.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.FS(embedFS)))
+	mux.Handle("/tty", xws.Handler(handleTTY))
+	mux.Handle("/ethernet", ethernetHandler(vn))
 	go func() {
-		if err := http.Serve(l, nil); err != nil {
+		if err := http.Serve(l, requireToken(token, mux)); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -192,6 +200,7 @@ func main() {
 	browser := rod.New().ControlURL(u).MustConnect()
 	defer browser.MustClose()
 	query := url.Values{}
+	query.Set(tokenParam, token)
 	query.Set("9p", p9l.Addr().String())
 	query.Set("POSTGRES_DB", pgDB)
 	query.Set("POSTGRES_USER", pgUser)
@@ -208,6 +217,47 @@ func main() {
 	<-sig
 
 	fmt.Println("\nShutting down...")
+}
+
+const (
+	tokenParam  = "token"
+	tokenCookie = "pg17s_token"
+)
+
+func newToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// requireToken rejects requests that don't carry token, so other local
+// processes can't reach the tty or ethernet relay on the loopback port.
+// The browser gets it as a query param on the initial page load and is
+// handed a cookie so subresource and websocket requests are covered too.
+func requireToken(token string, next http.Handler) http.Handler {
+	valid := func(s string) bool {
+		return subtle.ConstantTimeCompare([]byte(s), []byte(token)) == 1
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c, err := r.Cookie(tokenCookie); err == nil && valid(c.Value) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if valid(r.URL.Query().Get(tokenParam)) {
+			http.SetCookie(w, &http.Cookie{
+				Name:     tokenCookie,
+				Value:    token,
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+			})
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
 }
 
 func envOr(key, def string) string {

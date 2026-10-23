@@ -11,6 +11,7 @@ require (
 	github.com/hugelgupf/p9 v0.3.1-0.20240118043522-6f4f11e5296e
 	github.com/progrium/go-netstack v0.0.0-20260307051045-c26b546d338c
 	golang.org/x/net v0.55.0
+	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.47.0
 	tractor.dev/wanix v0.0.0-20261023035327-fdc5297ae8fa
 )
@@ -31,7 +32,6 @@ require (
 	github.com/ysmood/leakless v0.9.0 // indirect
 	golang.org/x/mod v0.30.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
 	tractor.dev/toolkit-go v0.0.0-20250103001615-9a6753936c19 // indirect
