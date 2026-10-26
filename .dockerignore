@@ -1,0 +1,6 @@
+.git
+.dev
+.local
+dist
+data
+postgres17-standalone

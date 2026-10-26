@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,8 +29,6 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/launcher"
 	"github.com/gorilla/websocket"
 	"github.com/hugelgupf/p9/p9"
 	"github.com/progrium/go-netstack/vnet"
@@ -42,12 +41,18 @@ import (
 	"tractor.dev/wanix/fs/p9kit"
 	"tractor.dev/wanix/fs/tarfs"
 	"tractor.dev/wanix/fs/vfs"
+	"tractor.dev/webframe"
 )
 
 var Version string
 
 //go:embed init index.html assets
 var embedFS embed.FS
+
+// The web view's event loop must run on the main OS thread.
+func init() {
+	runtime.LockOSThread()
+}
 
 func main() {
 	os.Exit(run())
@@ -57,12 +62,23 @@ func run() int {
 	defer restoreTerminal()
 
 	port := flag.Int("p", 5432, "host port to listen on and forward to postgres")
-	debug := flag.Bool("debug", false, "show the browser and boot to a shell; Ctrl+C goes to the guest, Ctrl+D detaches")
+	debug := flag.Bool("debug", false, "show the web view with its inspector and boot to a shell; Ctrl+C goes to the guest, Ctrl+D detaches")
+	version := flag.Bool("v", false, "print version and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-p port] [-debug] <dataDir>\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [-p port] [-debug] [-v] <dataDir>\n", os.Args[0])
 		flag.PrintDefaults()
+		if runtime.GOOS == "linux" {
+			fmt.Fprintln(flag.CommandLine.Output(), "\nWithout DISPLAY or WAYLAND_DISPLAY, a private Xvfb is started if installed.")
+		}
 	}
 	flag.Parse()
+	if *version {
+		if Version == "" {
+			Version = "dev"
+		}
+		fmt.Println(Version)
+		return 0
+	}
 	if flag.NArg() != 1 {
 		flag.Usage()
 		os.Exit(2)
@@ -216,9 +232,6 @@ func run() int {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
 	<-ready
-	u := launcher.New().Headless(!*debug).MustLaunch()
-	browser := rod.New().ControlURL(u).MustConnect()
-	defer browser.MustClose()
 	query := url.Values{}
 	query.Set(tokenParam, token)
 	query.Set("9p", p9l.Addr().String())
@@ -228,13 +241,51 @@ func run() int {
 	if *debug {
 		query.Set("debug", "1")
 	}
-	page := browser.MustPage(fmt.Sprintf("http://%s/?%s", l.Addr().String(), query.Encode()))
-	page.MustWaitLoad()
 
+	if err := ensureDisplay(); err != nil {
+		log.Fatal(err)
+	}
+
+	closed := make(chan struct{})
+	var closedOnce sync.Once
+	frame, err := webframe.New(webframe.Options{
+		Debug:  *debug,
+		Window: *debug,
+		Width:  800,
+		Height: 600,
+		Console: func(level, text string) {
+			if *debug {
+				log.Printf("page %s: %s", level, text)
+			}
+		},
+		Exception: func(text string) { log.Println("page:", text) },
+		Closed:    func() { closedOnce.Do(func() { close(closed) }) },
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	frame.Navigate(fmt.Sprintf("http://%s/?%s", l.Addr().String(), query.Encode()))
+
+	done := make(chan int, 1)
+	go func() {
+		done <- wait(ctl, sig, detach, closed)
+		frame.Terminate()
+	}()
+	frame.Run()
+	return <-done
+}
+
+// wait blocks until the guest halts, the user asks to stop, or the
+// webview window (and with it the VM) goes away.
+func wait(ctl *guestControl, sig <-chan os.Signal, detach, closed <-chan struct{}) int {
 	select {
 	case rc := <-ctl.halted:
 		// guest exited on its own (postgres died, or the debug shell exited)
 		return rc
+	case <-closed:
+		restoreTerminal()
+		fmt.Fprintln(os.Stderr, "\nWindow closed; data image may need recovery on next start")
+		return 1
 	case <-sig:
 	case <-detach:
 	}

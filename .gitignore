@@ -42,3 +42,5 @@ go.work.sum
 /assets/bzImage
 /data
 /postgres17-standalone
+/.dev/build
+/.dev/tmp
