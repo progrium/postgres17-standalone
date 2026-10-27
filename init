@@ -1,5 +1,5 @@
 #!/bin/busybox sh
-/bin/busybox --install -s /bin
+echo "Kernel booted, starting init..."
 
 export LANG=en_US.utf8
 export PATH=/usr/local/bin:$PATH

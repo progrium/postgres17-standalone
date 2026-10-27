@@ -143,9 +143,7 @@ func run() int {
 	}
 	ctl := newGuestControl(ctlL)
 
-	var ready chan bool = make(chan bool)
 	go func() {
-
 		var opts []p9.ServerOpt
 		// opts = append(opts, p9.WithServerLogger(ulog.Log))
 
@@ -154,11 +152,6 @@ func run() int {
 			log.Fatal(err)
 		}
 		defer f.Close()
-
-		datadir, err := localfs.New(dataDir)
-		if err != nil {
-			log.Fatal(err)
-		}
 
 		archiveFS, err := tarfs.From(tar.NewReader(f))
 		if err != nil {
@@ -193,11 +186,14 @@ func run() int {
 		if err := fsys.Bind(rootfs, ".", "root"); err != nil {
 			log.Fatal(err)
 		}
+
+		datadir, err := localfs.New(dataDir)
+		if err != nil {
+			log.Fatal(err)
+		}
 		if err := fsys.Bind(datadir, ".", "data"); err != nil {
 			log.Fatal(err)
 		}
-
-		close(ready)
 
 		// Run the server.
 		s := p9.NewServer(p9kit.Attacher(fsys, p9kit.WithMemAttrStore()), opts...)
@@ -231,7 +227,6 @@ func run() int {
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
-	<-ready
 	query := url.Values{}
 	query.Set(tokenParam, token)
 	query.Set("9p", p9l.Addr().String())
