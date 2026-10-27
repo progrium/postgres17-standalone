@@ -202,23 +202,25 @@ func run() int {
 		}
 	}()
 
-	l, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		log.Fatal(err)
-	}
 	token, err := newToken()
 	if err != nil {
 		log.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(embedFS)))
 	detach := make(chan struct{})
-	var detachOnce sync.Once
-	mux.Handle("/console", xws.Handler(func(c *xws.Conn) {
-		handleTTY(c, *debug, func() { detachOnce.Do(func() { close(detach) }) })
-	}))
-	mux.Handle("/ethernet", ethernetHandler(vn))
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	go func() {
+		mux := http.NewServeMux()
+		var detachOnce sync.Once
+		mux.Handle("/console", xws.Handler(func(c *xws.Conn) {
+			handleTTY(c, *debug, func() { detachOnce.Do(func() { close(detach) }) })
+		}))
+		mux.Handle("/ethernet", ethernetHandler(vn))
+		mux.Handle("/", http.FileServer(http.FS(embedFS)))
+
 		if err := http.Serve(l, requireToken(token, mux)); err != nil {
 			log.Fatal(err)
 		}
