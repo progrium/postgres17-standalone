@@ -71,10 +71,15 @@ rm -rf "$root"/usr/lib/libLLVM* \
 	"$root"/usr/local/include \
 	"$root"/usr/share/doc "$root"/usr/share/man
 
-# Hard links are stored as copies: Zig's tar reader only takes files,
-# directories and symlinks.
+# Hard links become separate copies, since Zig's tar reader only takes
+# files, directories and symlinks. Done in the tree rather than with GNU
+# tar's --hard-dereference, which macOS's bsdtar lacks.
+find "$root" -type f -links +1 | while IFS= read -r f; do
+	cp -p "$f" "$f.copy" && mv -f "$f.copy" "$f"
+done
 mkdir -p "$(dirname "$OUT")"
-(cd "$root" && tar --hard-dereference --numeric-owner --owner=0 --group=0 -cf - .) |
-	xz -9 -T0 >"$OUT.tmp"
+# Separate steps, so a tar failure isn't hidden by the pipe.
+(cd "$root" && tar -cf "$work/root.tar" .)
+xz -9 -T0 -c "$work/root.tar" >"$OUT.tmp"
 mv "$OUT.tmp" "$OUT"
 echo "root.sh: wrote $OUT ($(du -h "$OUT" | cut -f1))" >&2

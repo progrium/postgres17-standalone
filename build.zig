@@ -81,9 +81,15 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
 
-/// The macOS SDK's paths, from $SDKROOT, as hyper9's build adds them.
+/// The macOS SDK's paths, as hyper9's build adds them: from $SDKROOT, or
+/// on a Mac from `xcrun --show-sdk-path` (what hyper9's scripts/env.sh sets
+/// SDKROOT to), since Zig doesn't find the Hypervisor framework itself.
 fn addSdkPaths(b: *std.Build, m: *std.Build.Module) void {
-    const sdk = b.graph.environ_map.get("SDKROOT") orelse return;
+    const sdk = b.graph.environ_map.get("SDKROOT") orelse blk: {
+        if (b.graph.host.result.os.tag != .macos) return;
+        const out = b.run(&.{ "xcrun", "--show-sdk-path" });
+        break :blk std.mem.trim(u8, out, " \t\r\n");
+    };
     m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
     m.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
     m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
