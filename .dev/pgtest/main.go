@@ -276,10 +276,10 @@ func testServer(data string) {
 
 	stop("clean shutdown", p, conn)
 
-	if _, err := os.Stat(filepath.Join(data, "pgdata.img")); err != nil {
-		fail("data image", "%v", err)
+	if _, err := os.Stat(filepath.Join(data, "pgdata", "PG_VERSION")); err != nil {
+		fail("data directory", "%v", err)
 	} else {
-		ok("data image")
+		ok("data directory")
 	}
 
 	p, conn = boot("second boot", data)

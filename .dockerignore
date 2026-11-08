@@ -1,6 +1,9 @@
 .git
 .dev
 .local
+.zig-cache
+.zig-out
+zig-out
 dist
 data
 postgres17-standalone

@@ -1,65 +1,53 @@
 NAME			?= postgres17-standalone
-VERSION 		?= v0.2
-GOARGS			?=
-GOOS			?= $(shell go env GOOS)
-GOARCH			?= $(shell go env GOARCH)
+VERSION			?= dev
+HOST_OS			:= $(shell uname -s | tr A-Z a-z | sed 's/darwin/macos/')
+HOST_ARCH		:= $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+OS				?= $(HOST_OS)
+ARCH			?= $(HOST_ARCH)
+OPTIMIZE		?= ReleaseSafe
+OUT				?= $(NAME)
 DIST_DIR		?= dist
-DIST_OS			?= darwin windows linux linux-musl
-DIST_ARCH		?= arm64 amd64
-LDFLAGS			:= -s -w -X main.Version=$(VERSION)
+DIST_TARGETS	?= linux_amd64 linux_arm64 macos_arm64
 
-# No cgo: webframe (via glaze) binds the system web view at runtime via
-# purego, so binaries cross-compile anywhere and need no C toolchain.
-export CGO_ENABLED := 0
+ZIG_ARCH_amd64	:= x86_64
+ZIG_ARCH_arm64	:= aarch64
+# Linux builds are static musl binaries, so one runs on any distro, Alpine
+# included.
+zig_target		= $(ZIG_ARCH_$(2))-$(if $(filter macos,$(1)),macos,linux-musl)
 
-# Except linux-musl (Alpine): purego without cgo only works with glibc, so it
-# is built with cgo against musl, dynamically linked so it can load WebKitGTK.
-# Cross-compiled with zig.
-MUSL_ARCH_arm64	:= aarch64
-MUSL_ARCH_amd64	:= x86_64
-musl_env = CGO_ENABLED=1 CC="zig cc -target $(MUSL_ARCH_$(1))-linux-musl -dynamic"
-MUSL_LDFLAGS	:= -linkmode=external -extldflags=-dynamic
-
-## Build binary (OS=linux-musl for the musl build)
-OS				?= $(GOOS)
-MUSL			= $(filter linux-musl,$(OS))
-build: assets
-	GOOS=$(if $(MUSL),linux,$(OS)) GOARCH=$(GOARCH) $(if $(MUSL),$(call musl_env,$(GOARCH))) \
-	go build -trimpath -ldflags="$(LDFLAGS)$(if $(MUSL), $(MUSL_LDFLAGS))" $(GOARGS) .
+## Build ./postgres17-standalone for OS (linux, macos) and ARCH (amd64, arm64)
+build: assets/root-$(ARCH).tar.xz
+	zig build -Doptimize=$(OPTIMIZE) -Dtarget=$(call zig_target,$(OS),$(ARCH)) -Dversion=$(VERSION) \
+		-p .zig-out/$(OS)_$(ARCH)
+	cp .zig-out/$(OS)_$(ARCH)/bin/$(NAME) $(OUT)
 .PHONY: build
 
-## Build assets
-assets: assets/root.tar.br assets/bzImage
-.PHONY: assets
+## Pull and trim the postgres:17-alpine root for ARCH (assets/root-ARCH.tar.xz)
+root: assets/root-$(ARCH).tar.xz
+.PHONY: root
 
-assets/root.tar.br:
-	docker build --target postgres-export --output type=local,dest=./assets .
+assets/root-%.tar.xz:
+	scripts/root.sh $* $@
 
-assets/bzImage:
-	docker build --target kernel-export --output type=local,dest=./assets .
+## Run the unit tests
+test:
+	zig build test
+.PHONY: test
 
-## Build the Alpine container image
-image: assets
-	docker build --build-arg VERSION=$(VERSION) -t $(NAME) .
-.PHONY: image
-
-## Clean distribution directory
+## Clean build outputs
 clean:
-	rm -rf $(DIST_DIR)
+	rm -rf $(DIST_DIR) .zig-out zig-out .zig-cache $(NAME)
 .PHONY: clean
 
-DIST_TARGETS	:= $(foreach os, $(DIST_OS), $(foreach arch, $(DIST_ARCH), $(DIST_DIR)/$(NAME)_$(VERSION)_$(os)_$(arch).zip))
-
-## Build distribution zips
-dist: $(DIST_TARGETS)
+## Build distribution zips (dist/postgres17-standalone_VERSION_OS_ARCH.zip)
+dist: $(foreach t,$(DIST_TARGETS),$(DIST_DIR)/$(NAME)_$(VERSION)_$(t).zip)
 .PHONY: dist
 
-$(DIST_TARGETS): $(DIST_DIR)/%.zip:
-	$(eval DIST_OS_ := $(word 3, $(subst _, ,$*)))
-	$(eval DIST_BIN := $(DIST_DIR)/$*/$(NAME)$(if $(filter windows,$(DIST_OS_)),.exe))
-	$(MAKE) build OS=$(DIST_OS_) GOARCH=$(word 4, $(subst _, ,$*)) GOARGS="$(GOARGS) -o $(DIST_BIN)"
+$(DIST_DIR)/$(NAME)_$(VERSION)_%.zip:
+	mkdir -p $(DIST_DIR)/$*
+	$(MAKE) build OS=$(word 1,$(subst _, ,$*)) ARCH=$(word 2,$(subst _, ,$*)) OUT=$(DIST_DIR)/$*/$(NAME)
 	rm -f $@
-	zip -j $@ $(DIST_BIN)
+	zip -j $@ $(DIST_DIR)/$*/$(NAME)
 	rm -rf $(DIST_DIR)/$*
 
 .DEFAULT_GOAL := show-help

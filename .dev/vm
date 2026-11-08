@@ -161,6 +161,10 @@ cmd_shell() {
 	ssh_ "$1" -t
 }
 
+# zigos maps a VM to the Makefile's OS: alpine runs the same static musl
+# binary as linux.
+zigos() { case "$1" in macos) echo macos ;; *) echo linux ;; esac; }
+
 # build cross-compiles postgres17-standalone and the .dev/pgtest helper and
 # copies them into ~/postgres17 in the guest.
 build() {
@@ -173,7 +177,8 @@ build() {
 	esac
 	local out="$ROOT/.dev/build/$os" arch; arch=$(goarch "$os")
 	mkdir -p "$out"
-	make -s -C "$ROOT" build OS=$goos GOARCH="$arch" VERSION= GOARGS="-o $out/$BIN$exe"
+	case "$os" in windows) die "windows: h9 has no Windows backend yet" ;; esac
+	make -s -C "$ROOT" build OS="$(zigos "$os")" ARCH="$arch" VERSION=dev OUT="$out/$BIN$exe"
 	(cd "$DEV/pgtest" && GOWORK=off CGO_ENABLED=0 GOOS="${goos%-musl}" GOARCH="$arch" go build -trimpath -o "$out/pgtest$exe" .)
 	ssh_ "$os" 'mkdir postgres17' </dev/null >/dev/null 2>&1 || true
 	scp_ "$os" "$out/$BIN$exe" "$out/pgtest$exe" "lima-$(inst "$os"):postgres17/" </dev/null

@@ -1,0 +1,90 @@
+//! postgres17-standalone: Alpine's PostgreSQL 17 image run by hyper9 (h9)
+//! as a library, in one binary.
+//!
+//!   zig build                         build zig-out/bin/postgres17-standalone
+//!   zig build run -- -p 5433 data     build and run it
+//!   zig build -Dtarget=aarch64-linux-musl
+//!
+//! The binary embeds assets/root-<arch>.tar.xz, the Linux root for the
+//! target's architecture, which `make root` (scripts/root.sh) makes.
+
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const os = target.result.os.tag;
+
+    const version = b.option([]const u8, "version", "Version -v prints (default: dev)") orelse "dev";
+    const arch: []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => "amd64",
+        .aarch64 => "arm64",
+        else => @panic("postgres17-standalone runs on x86_64 and aarch64 hosts only"),
+    };
+    const root_path = b.option([]const u8, "root", "The Linux root tarball to embed (default assets/root-<arch>.tar.xz)") orelse
+        b.fmt("assets/root-{s}.tar.xz", .{arch});
+
+    // No GUI: the machine has no screen. Unicorn (GPLv2) stays out, so the
+    // binary runs on the host's hypervisor (HVF, KVM) or h9's native
+    // backend on x86_64 Linux.
+    const h9 = b.dependency("h9", .{
+        .target = target,
+        .optimize = optimize,
+        .gfx = .none,
+    });
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+
+    const exe = b.addExecutable(.{
+        .name = "postgres17-standalone",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "h9", .module = h9.module("h9") },
+            },
+        }),
+    });
+    exe.root_module.addOptions("build_options", options);
+    exe.root_module.addAnonymousImport("root_tar", .{ .root_source_file = b.path(root_path) });
+    if (os == .macos) {
+        addSdkPaths(b, exe.root_module);
+        exe.root_module.linkFramework("Hypervisor", .{});
+    }
+
+    const install = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install.step);
+
+    // HVF refuses to create a VM without the hypervisor entitlement.
+    var ready = &install.step;
+    if (os == .macos and b.graph.host.result.os.tag == .macos) {
+        const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-", "--entitlements" });
+        sign.addFileArg(b.path("h9.entitlements"));
+        sign.addArg(b.getInstallPath(.bin, exe.out_filename));
+        sign.step.dependOn(&install.step);
+        b.getInstallStep().dependOn(&sign.step);
+        ready = &sign.step;
+    }
+
+    const run = b.addSystemCommand(&.{b.getInstallPath(.bin, exe.out_filename)});
+    run.step.dependOn(ready);
+    if (b.args) |args| run.addArgs(args);
+    b.step("run", "Run postgres17-standalone").dependOn(&run.step);
+
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// The macOS SDK's paths, from $SDKROOT, as hyper9's build adds them.
+fn addSdkPaths(b: *std.Build, m: *std.Build.Module) void {
+    const sdk = b.graph.environ_map.get("SDKROOT") orelse return;
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    m.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+}

@@ -1,19 +1,18 @@
 # postgres17-standalone
 
-A single binary that runs PostgreSQL 17. It boots a 32-bit Linux VM in [v86](https://github.com/copy/v86) inside the OS's native webview via [webframe](https://github.com/tractordev/webframe). Postgres's data directory is a host folder shared with the VM over 9P, and the Postgres port is forwarded to the host through a virtual network.
+A single binary that runs PostgreSQL 17. It embeds Docker Hub's `postgres:17-alpine` image and runs it with [hyper9](https://github.com/progrium/hyper9) (h9), used as a Zig library. h9's Linux personality runs Alpine's own `postgres` binaries directly on the host's hypervisor, with h9's Plan 9 kernel answering their system calls. There's no Linux kernel to boot, no VM image, no webview, and no Docker.
 
-You don't need Docker or a local Postgres install. The webview is hidden and unthrottled, and is the one the OS already has:
+The image's `docker-entrypoint.sh` sets up the cluster on first run exactly as the Docker image does, so `POSTGRES_PASSWORD`, `POSTGRES_USER`, `POSTGRES_DB` and friends mean what they mean there.
 
-| Platform | Needs |
-|---|---|
-| macOS | Nothing |
-| Windows | Edge WebView2 Runtime (preinstalled on Windows 10/11) |
-| Linux (glibc) | WebKitGTK 4.1 or 6.0, plus a display or Xvfb |
-| Linux (musl, Alpine) | `apk add webkit2gtk-4.1 xvfb`, and the `linux-musl` build |
+| Platform | Backend | Needs |
+|---|---|---|
+| Linux x86_64 | KVM, or h9's native backend without it | Linux 5.11 or later; nothing else |
+| Linux arm64 | KVM | read/write access to `/dev/kvm` |
+| macOS (Apple Silicon) | Hypervisor.framework | Nothing |
 
-Debian/Ubuntu: `apt install libwebkit2gtk-4.1-0 xvfb`
+Linux builds are static musl binaries, so the same binary runs on glibc distros and Alpine. Windows isn't supported yet: h9 has no Windows hypervisor backend.
 
-On Linux, if neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, it starts its own private Xvfb and shuts it down when it exits.
+> **Proof of concept.** h9 is a research prototype and its Linux personality is young. This is a demonstration of running a real Linux service on it, not a production database.
 
 ## Usage
 
@@ -21,9 +20,9 @@ On Linux, if neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, it starts its own p
 POSTGRES_PASSWORD=secret postgres17-standalone [-p port] [-debug] [-v] <dataDir>
 ```
 
-- `dataDir` (required): the host directory used as Postgres's data directory. It is created if it doesn't exist.
-- `-p`: the host port to listen on, on all interfaces. Defaults to `5432`.
-- `-debug`: show the webview in a window with its web inspector and start a shell in the VM instead of Postgres. Your terminal is attached to the VM console in raw mode, so Ctrl-C goes to the guest; press Ctrl-D to shut down. Closing the window stops the VM without a clean shutdown.
+- `dataDir` (required): the host directory that holds the data. It is created if it doesn't exist. Postgres's data directory (`PGDATA`) is its `pgdata` subdirectory, as ordinary host files.
+- `-p`: the port Postgres listens on, on all interfaces. Defaults to `5432`. Postgres uses the host's own network stack, so there's no port forwarding.
+- `-debug`: start a shell in the Alpine root instead of Postgres, with the data directory at `/mnt/term/cwd`.
 - `-v`: print the version.
 
 Environment variables:
@@ -33,55 +32,58 @@ Environment variables:
 | `POSTGRES_PASSWORD` | yes (not with `-debug`) |            |
 | `POSTGRES_USER`     | no       | `postgres` |
 | `POSTGRES_DB`       | no       | `postgres` |
+| `POSTGRES_INITDB_ARGS`, `POSTGRES_INITDB_WALDIR`, `POSTGRES_HOST_AUTH_METHOD`, `TZ` | no | passed to the image as in Docker |
 | `POSTGRES17_STANDALONE_CACHE_DIR` | no | `<user cache dir>/postgres17-standalone` |
 
-On first run the root image is decompressed into the cache dir. The cached file is named after a hash of the embedded image, so a new version unpacks a fresh copy and deletes the old one.
+On first run the root image is unpacked into the cache dir (about 90 MB, a few seconds). The directory is named after a hash of the embedded image, so a new version unpacks a fresh copy and deletes the old one.
 
-The VM console output is streamed to stdout. Press Ctrl-C (or send SIGTERM) to shut down cleanly: Postgres does a fast shutdown and the data image is unmounted before exit. Press Ctrl-C again to force an immediate exit.
+Only one instance can use a data directory at a time. Postgres's output is streamed to stdout. Press Ctrl-C (or send SIGTERM) to shut down cleanly: Postgres does a fast shutdown. Press Ctrl-C again, or wait 30 seconds, to force an immediate exit; Postgres recovers from its WAL on the next start.
 
 ```sh
 psql -h localhost -U postgres
 ```
 
-## Docker
+## How it works
 
-The [Dockerfile](Dockerfile) builds an Alpine image with WebKitGTK and Xvfb:
+[src/main.zig](src/main.zig) is the whole program:
 
-```sh
-docker build -t postgres17-standalone .
-docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=secret \
-  -v pgdata:/data --stop-timeout 60 postgres17-standalone
-```
+1. It locks `<dataDir>/.lock` and unpacks the embedded root ([scripts/root.sh](scripts/root.sh) builds it) into the cache dir.
+2. It creates an `h9.Machine` with that tree as its Linux root, the data directory as its writable cwd (`/mnt/term/cwd` in the guest), the network enabled so Postgres can listen on host ports, and the image's environment plus `PGDATA` and `PGPORT`.
+3. It runs `/usr/local/bin/docker-entrypoint.sh postgres` in the machine. Writes to the root, such as the socket in `/var/run/postgresql`, go to an overlay in memory; only the data directory persists.
+4. SIGINT and SIGTERM post an `interrupt` note, which the Linux personality delivers to Postgres as SIGINT, a fast shutdown. A second signal stops the machine.
 
-It runs as a non-root user with the data directory at `/data`, and `docker stop` shuts Postgres down cleanly.
+[src/host.zig](src/host.zig) is the host side of the console and signals (adapted from h9's CLI), and [src/cli.zig](src/cli.zig) parses the flags.
 
 ## Building
 
+Requires [Zig 0.16](https://ziglang.org/download/), and for the root image `curl`, `jq`, GNU `tar` and `xz`. hyper9 is a git submodule, since it can't be fetched as a Zig package yet:
+
 ```sh
-make build                              # build assets and ./postgres17-standalone
-make build OS=linux-musl GOARCH=arm64   # musl build for Alpine
-make assets                             # build root.tar.br and bzImage via Docker
-make dist VERSION=v0.3                  # dist/postgres17-standalone_v0.3_<os>_<arch>.zip for all targets
+git submodule update --init
+make build                       # pulls the root for this host's arch, builds ./postgres17-standalone
+make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos; ARCH: amd64, arm64)
+make root ARCH=arm64             # just assets/root-arm64.tar.xz
+make dist VERSION=v0.3           # dist/postgres17-standalone_v0.3_<os>_<arch>.zip
+make test                        # unit tests
 ```
 
-Builds use `CGO_ENABLED=0` and cross-compile from anywhere with plain Go. The system webview is loaded at runtime via [purego](https://github.com/ebitengine/purego). The Linux binary still depends on the system's glibc and its loader, which every glibc distro provides.
+`zig build` works directly too, once `assets/root-<arch>.tar.xz` exists; `-Droot=FILE` embeds another tarball. macOS builds have to be made on a Mac (for the SDK's Hypervisor framework) and are ad-hoc signed with [h9.entitlements](h9.entitlements).
 
-The exception is `linux-musl` for Alpine. purego without cgo only works with glibc, so that build uses cgo against musl and cross-compiles with [zig](https://ziglang.org) (`zig cc`). You only need zig to build those targets.
+`scripts/root.sh` pulls the image from Docker Hub's registry and drops what a server doesn't need (LLVM for JIT, headers, docs), which takes the compressed root from 77 MB to 22 MB. With `ROOT_DIR` set to an unpacked image tree (`docker export` output, for one) it skips the pull.
 
 ## Testing
 
-`.dev/vm` uses [Lima](https://lima-vm.io) to run postgres17-standalone and a set of end-to-end tests on real VMs: Ubuntu, Alpine, macOS 15, and Windows 11 ARM64.
+[.dev/pgtest](.dev/pgtest) boots Postgres, queries it, checks the data directory lock, shuts down with an interrupt, and boots again to check the data persisted. Build it next to the binary and run it:
 
 ```sh
-.dev/vm up linux               # create/start postgres17-linux
-.dev/vm test                   # build, copy, and run the tests on every running VM
-.dev/vm run macos data         # run it in a VM; POSTGRES_* env passes through
-.dev/vm status | shell | down | rm
+(cd .dev/pgtest && go build -o ../../pgtest .) && ./pgtest
 ```
 
-The tests ([.dev/pgtest](.dev/pgtest)) boot Postgres, query it, check the data directory lock, shut down with an interrupt, and boot again to check the data persisted. The macOS and Windows VMs set up auto-login, since the web view needs a desktop session. On Windows, a small Go helper ([.dev/winrun](.dev/winrun)) runs programs in that session through a scheduled task. It's used instead of PowerShell, which takes about 20 seconds to start in the ARM64 guest.
+`.dev/vm` uses [Lima](https://lima-vm.io) to run the same tests on Ubuntu, Alpine and macOS VMs (`.dev/vm up linux`, `.dev/vm test`).
 
-Lima's Windows support is experimental, and the first install needs some manual steps in the VM display. They're listed in [.dev/lima/windows.yaml](.dev/lima/windows.yaml).
+## Docker
+
+The [Dockerfile](Dockerfile) builds an Alpine image with the binary. It hasn't been tested with this version: without `/dev/kvm` in the container, h9's native backend needs a seccomp profile that allows Syscall User Dispatch.
 
 ## License
 
