@@ -87,7 +87,7 @@ Connect an app:
 
 ```sh
 minipg url app.pgdb                  # postgres://postgres:...@127.0.0.1:54321/app
-minipg run app.pgdb -- npm start     # npm start, with DATABASE_URL and PG* set
+minipg run app.pgdb -- env           # run npm start, etc with DATABASE_URL and PG* set
 ```
 
 Back it up and restore it:
