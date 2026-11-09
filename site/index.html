@@ -18,9 +18,7 @@
   table { border-collapse: collapse; margin-left: 2em; }
   td { padding: 0.1em 1em 0.1em 0; vertical-align: top; }
   td:first-child { white-space: nowrap; }
-  #demo-box { width: 100%; height: 30em; border: 1px solid #888; display: flex; align-items: center; justify-content: center; box-sizing: border-box; }
-  #demo-box iframe { width: 100%; height: 100%; border: 0; }
-  #demo-box button { font: inherit; padding: 0.4em 1em; }
+  #demo-frame { width: 100%; height: 30em; border: 1px solid #888; box-sizing: border-box; }
 </style>
 </head>
 <body>
@@ -78,16 +76,7 @@ other browsers are getting it.
 It can also be <a href="demo/">opened on its own page</a>.
 </p>
 
-<div id="demo-box"><button id="start">Start the demo</button></div>
-<script>
-  document.getElementById('start').onclick = () => {
-    const f = document.createElement('iframe');
-    f.src = 'demo/';
-    f.title = 'minipg running in the browser';
-    document.getElementById('demo-box').replaceChildren(f);
-    f.focus();
-  };
-</script>
+<iframe id="demo-frame" src="demo/" title="minipg running in the browser"></iframe>
 
 <p>
 The demo runs minipg's Linux build, which runs inside the Postgres image itself.

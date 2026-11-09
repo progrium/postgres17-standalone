@@ -52,7 +52,8 @@ term.loadAddon(fit);
 term.open(document.getElementById('term'));
 fit.fit();
 addEventListener('resize', () => fit.fit());
-term.focus();
+// Embedded, the page keeps its scroll: the terminal takes focus on a click.
+if (window === window.top) term.focus();
 
 // Fetches the root archive with progress, and gunzips it into a blob the
 // Worker can fetch by URL.
