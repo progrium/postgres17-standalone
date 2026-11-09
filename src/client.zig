@@ -95,6 +95,8 @@ pub fn ensure(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !Running {
 fn spawn(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !std.process.Child {
     const self = try std.process.executablePathAlloc(ctx.io, ctx.arena);
     const idle = try std.fmt.allocPrint(ctx.arena, "--idle={d}", .{opts.idle_timeout});
+    const std_handles = sys.StdNoInherit.begin();
+    defer std_handles.restore();
     return std.process.spawn(ctx.io, .{
         .argv = &.{ self, "serve", "--background", idle, p.path },
         .stdin = .ignore,

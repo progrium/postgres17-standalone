@@ -89,8 +89,42 @@ fn dial(io: std.Io, socket: []const u8) !std.Io.net.Stream {
     return ua.connect(io) catch return error.NotRunning;
 }
 
-/// Sends `command` and reads the whole reply.
+/// How long `request` waits for a whole reply.
+pub const request_timeout_ms = 10_000;
+
+/// Sends `command` and reads the whole reply, giving up after
+/// `request_timeout_ms`. On Windows an exchange has been seen to stall
+/// with the server gone, which would hang a command's wait for its server.
 pub fn request(arena: std.mem.Allocator, io: std.Io, socket: []const u8, command: []const u8) !Reply {
+    const U = union(enum) { reply: anyerror!Reply, timeout: std.Io.Cancelable!void };
+    var buf: [2]U = undefined;
+    var sel: std.Io.Select(U) = .init(io, &buf);
+    sel.concurrent(.reply, requestAny, .{ arena, io, socket, command }) catch
+        return requestOnce(arena, io, socket, command);
+    sel.concurrent(.timeout, std.Io.sleep, .{ io, .fromMilliseconds(request_timeout_ms), .awake }) catch {
+        const first = sel.await() catch |err| {
+            sel.cancelDiscard();
+            return err;
+        };
+        sel.cancelDiscard();
+        return first.reply;
+    };
+    const first = sel.await() catch |err| {
+        sel.cancelDiscard();
+        return err;
+    };
+    sel.cancelDiscard();
+    return switch (first) {
+        .reply => |r| r,
+        .timeout => error.Timeout,
+    };
+}
+
+fn requestAny(arena: std.mem.Allocator, io: std.Io, socket: []const u8, command: []const u8) anyerror!Reply {
+    return requestOnce(arena, io, socket, command);
+}
+
+fn requestOnce(arena: std.mem.Allocator, io: std.Io, socket: []const u8, command: []const u8) !Reply {
     const conn = try dial(io, socket);
     defer conn.close(io);
     var wbuf: [256]u8 = undefined;

@@ -49,7 +49,7 @@ Download the zip for your platform from the releases page, unzip it, and put `mi
 | Linux x86_64 | KVM, or h9's native backend with `MINIPG_BACKEND=native` | Read and write access to `/dev/kvm`; for native, Linux 5.11 or later | Yes, on the native backend |
 | Linux arm64 | KVM | Read and write access to `/dev/kvm` | Builds; not run |
 | macOS (Apple Silicon) | Hypervisor.framework | The hypervisor entitlement (release builds are signed ad hoc with it) | Builds; not run |
-| Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature turned on | WINDOWS_TESTED |
+| Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature turned on | Yes, on WHP |
 
 Linux builds are static musl binaries, so the same binary runs on glibc distros, Alpine, and minimal container images. Intel Macs and Windows on ARM aren't supported yet. (h9 has no WHP backend for arm64 yet, and minipg leaves out h9's emulator, which is GPL-licensed.)
 
@@ -654,7 +654,7 @@ The `.pgdb` holds only data and settings. Runtime state, logs, and unpacked root
 
 `<key>` is a hash of the `.pgdb` directory's device and inode (on Windows, its volume serial number and file index), so it follows the directory, not its name. On Linux, the runtime directory falls back to `~/.cache/minipg/run/` when `XDG_RUNTIME_DIR` isn't set, and `XDG_STATE_HOME` and `XDG_CACHE_HOME` replace `~/.local/state` and `~/.cache`. Runtime directories are mode 0700; on Windows, `%LOCALAPPDATA%` is already private to your account.
 
-On Windows, which lets only administrators (or Developer Mode) make symlinks, the root's symlinks unpack as hard links to their targets, and its few directory links as copies.
+On Windows, which lets only administrators (or Developer Mode) make symlinks, the root's symlinks unpack as hard links to their targets, and its few directory links as copies. On Windows, each server also commits its whole 2 GB of guest memory up front (1 GB for each running tool), so an 8 GB machine runs three or four servers at once.
 
 Everything here can be deleted while no server runs. Roots unpack again and logs start over.
 

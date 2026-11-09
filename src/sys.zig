@@ -42,6 +42,41 @@ pub const win = struct {
     pub extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
     pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, sa: ?*anyopaque, disposition: DWORD, flags: DWORD, template: ?HANDLE) callconv(.winapi) HANDLE;
     pub extern "kernel32" fn GetFileInformationByHandle(h: HANDLE, info: *BY_HANDLE_FILE_INFORMATION) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn GetStdHandle(which: DWORD) callconv(.winapi) ?HANDLE;
+    pub extern "kernel32" fn GetHandleInformation(h: HANDLE, flags: *DWORD) callconv(.winapi) BOOL;
+    pub extern "kernel32" fn SetHandleInformation(h: HANDLE, mask: DWORD, flags: DWORD) callconv(.winapi) BOOL;
+    pub const HANDLE_FLAG_INHERIT: DWORD = 1;
+};
+
+/// The standard handles, made non-inheritable while a child is spawned.
+/// CreateProcess passes every inheritable handle to the child, so a
+/// background server would hold the caller's stdout pipe open, and
+/// `$x = minipg shell ...` would wait for the server to idle out. A no-op
+/// on POSIX, where std closes them in the child.
+pub const StdNoInherit = struct {
+    handles: [3]?win.HANDLE = .{ null, null, null },
+
+    pub fn begin() StdNoInherit {
+        var s: StdNoInherit = .{};
+        if (!is_windows) return s;
+        // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE.
+        const which = [3]win.DWORD{ @bitCast(@as(i32, -10)), @bitCast(@as(i32, -11)), @bitCast(@as(i32, -12)) };
+        for (which, 0..) |w, i| {
+            const h = win.GetStdHandle(w) orelse continue;
+            if (h == std.os.windows.INVALID_HANDLE_VALUE) continue;
+            var flags: win.DWORD = 0;
+            if (!win.GetHandleInformation(h, &flags).toBool() or flags & win.HANDLE_FLAG_INHERIT == 0) continue;
+            if (win.SetHandleInformation(h, win.HANDLE_FLAG_INHERIT, 0).toBool()) s.handles[i] = h;
+        }
+        return s;
+    }
+
+    pub fn restore(s: StdNoInherit) void {
+        if (!is_windows) return;
+        for (s.handles) |h| if (h) |x| {
+            _ = win.SetHandleInformation(x, win.HANDLE_FLAG_INHERIT, win.HANDLE_FLAG_INHERIT);
+        };
+    }
 };
 
 /// This process's id.

@@ -177,7 +177,15 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     const run_json = try control.runJsonPath(arena, runtime);
     defer std.Io.Dir.cwd().deleteFile(io, run_json) catch {};
 
-    (try std.Thread.spawn(.{}, acceptLoop, .{ &s, &listener })).detach();
+    const accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ &s, &listener });
+    // Before the listener closes: closing it under a pending accept cancels
+    // the accept, which std on Windows takes as unreachable (a panic). A
+    // connection of our own wakes it to see `done`.
+    defer {
+        s.done.store(true, .release);
+        if (ua.connect(io)) |c| c.close(io) else |_| {}
+        accept_thread.join();
+    }
     const monitor_thread = try std.Thread.spawn(.{}, monitor, .{&s});
 
     // The machine's environment and Postgres's command line.

@@ -91,7 +91,7 @@ psql, pg_dump, and the other tools run in their own short-lived h9 machine (abou
 | Linux x86_64 | KVM, or h9's native backend with `MINIPG_BACKEND=native` | read/write `/dev/kvm`; for native, Linux 5.11 or later | Yes, native backend |
 | Linux arm64 | KVM | read/write `/dev/kvm` | Builds; not run |
 | macOS (Apple Silicon) | Hypervisor.framework | the hypervisor entitlement (the build signs ad hoc) | Not run |
-| Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature on | WINDOWS_TESTED |
+| Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature on | Yes, on WHP |
 
 Linux builds are static musl binaries, so one runs on glibc distros and Alpine alike. Windows on ARM isn't supported yet: h9 has no WHP backend for arm64, and minipg leaves out h9's emulator, which is GPL-licensed.
 
@@ -145,7 +145,8 @@ make e2e      # builds ./minipg, then drives it end to end (.dev/e2e, Go)
 - **Killed servers.** On the native backend each Postgres process is its own host process. If the server process is killed outright (SIGKILL, OOM), they live on for a few seconds before exiting, and the `.pgdb` stays locked until they do; minipg waits for that. Postgres recovers from its WAL on the next start.
 - **pg_restore from a pipe.** pg_restore misreads a custom-format archive on stdin inside h9, so `minipg restore` spools stdin to a temp file first.
 - **Cross-arch.** A `.pgdb` records the arch it was created on, and the server warns when it's opened on another.
-- **Windows roots.** Windows lets only administrators (or Developer Mode) make symlinks, so on Windows the root's symlinks are unpacked as hard links to their targets, and its few directory links as copies. Inside the guest, `symlink` doesn't work on Windows hosts.
+- **Windows roots.** Windows lets only administrators (or Developer Mode) make symlinks, so on Windows the root's symlinks are unpacked as hard links to their targets, and its few directory links as copies.
+- **Windows memory.** WHP commits a machine's whole guest memory up front: 2 GB for each server and 1 GB for each running tool. On an 8 GB machine, three or four servers at once is the limit, and the page file grows with them.
 
 ## License
 
