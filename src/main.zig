@@ -17,7 +17,6 @@ const commands = @import("commands.zig");
 const paths = @import("paths.zig");
 const Ctx = @import("ctx.zig").Ctx;
 
-
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
