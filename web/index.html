@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>minipg in the browser</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="xterm/xterm.css">
+<script src="xterm/xterm.js"></script>
+<script src="xterm/addon-fit.js"></script>
+<style>
+  :root { --bg: #fbfbf8; --fg: #1d1d1d; --dim: #6b6b6b; --accent: #2a5db0; --line: #e2e2dc; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #e8e8e0; --dim: #9a9a9a; --accent: #7aa7ee; --line: #2a2a2a; } }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { display: flex; flex-direction: column; font: 14px/1.45 system-ui, sans-serif; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  header b { font-size: 15px; }
+  header span { color: var(--dim); }
+  header a { color: var(--accent); }
+  #status { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
+  #term { flex: 1; min-height: 0; padding: 8px 0 8px 12px; }
+  .xterm .xterm-viewport { background: transparent !important; }
+</style>
+</head>
+<body>
+<header>
+  <b>minipg</b>
+  <span>PostgreSQL as a file, running in your browser: Postgres 18 for 386 Linux on <a href="https://github.com/progrium/hyper9">h9</a>, in a Web Worker.</span>
+  <span id="status"></span>
+</header>
+<div id="term"></div>
+<script type="module">
+import { createMachine, haveJSPI } from './h9-web.js';
+
+const { Terminal, FitAddon: { FitAddon } } = window;
+// Embedded in the project page, which already says what this is.
+if (window !== window.top) document.querySelector('header > span:not(#status)')?.remove();
+const status = document.getElementById('status');
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+const term = new Terminal({
+  fontFamily: 'ui-monospace, Menlo, Consolas, monospace',
+  fontSize: 14,
+  // The guest writes \n; the terminal needs \r\n.
+  convertEol: true,
+  cursorBlink: true,
+  theme: dark
+    ? { background: '#141414', foreground: '#e8e8e0', cursor: '#7aa7ee', selectionBackground: '#3a4a66' }
+    : { background: '#fbfbf8', foreground: '#1d1d1d', cursor: '#2a5db0', selectionBackground: '#c9d7f0' },
+});
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById('term'));
+fit.fit();
+addEventListener('resize', () => fit.fit());
+term.focus();
+
+// Fetches the root archive with progress, and gunzips it into a blob the
+// Worker can fetch by URL.
+async function loadRoot(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status} ${r.statusText}`);
+  const total = Number(r.headers.get('content-length')) || 0;
+  let got = 0;
+  const counted = r.body.pipeThrough(new TransformStream({
+    transform(chunk, c) {
+      got += chunk.length;
+      status.textContent = `downloading ${(got / 1e6).toFixed(1)}${total ? ` of ${(total / 1e6).toFixed(1)}` : ''} MB`;
+      c.enqueue(chunk);
+    },
+  }));
+  // A server may already have undone the gzip (Content-Encoding).
+  const gz = r.headers.get('content-encoding') !== 'gzip';
+  const body = gz ? counted.pipeThrough(new DecompressionStream('gzip')) : counted;
+  return URL.createObjectURL(await new Response(body).blob());
+}
+
+if (!haveJSPI) {
+  term.write('This browser lacks JavaScript Promise Integration, which h9 needs (Chrome 137 or later).\n');
+} else {
+  const root = await loadRoot('minipg.h9a.gz').catch((e) => { term.write(`${e.message}\n`); return null; });
+  status.textContent = '';
+  if (root) await start(root);
+}
+
+async function start(root) {
+  let raw = false;
+  let line = ''; // the line being typed, in cooked mode
+  const m = await createMachine({
+    root,
+    memory: '1G',
+    tty: true,
+    terminal: { write: (b) => term.write(b), setRaw: (on) => { raw = on; } },
+  });
+  // Raw mode (the shell's and psql's line editors) gets keys as they are.
+  // Cooked mode, while a command runs, gets the page's line editing: it
+  // echoes, as a host terminal would, and sends each line whole.
+  term.onData((d) => {
+    if (raw) { m.input(d); return; }
+    if (d.startsWith('\x1b')) return; // arrow keys and the like
+    for (const ch of d) {
+      if (ch === '\r') { term.write('\n'); m.input(line + '\n'); line = ''; }
+      else if (ch === '\x7f' || ch === '\b') { if (line) { line = line.slice(0, -1); term.write('\b \b'); } }
+      else if (ch === '\x03') { m.interrupt(); term.write('^C\n'); line = ''; }
+      else if (ch === '\x04') { m.input(line + '\x04'); line = ''; }
+      else if (ch === '\x1b' || ch < ' ') { /* escape sequences and other controls: dropped */ }
+      else { line += ch; term.write(ch); }
+    }
+  });
+  const argv = [
+    '--env', 'HOME=/root', '--env', 'TERM=xterm-256color', '--env', 'LANG=C.UTF-8',
+    '--', '/bin/busybox', 'sh', '-c', '/bin/busybox --install -s 2>/dev/null; exec sh -l -i',
+  ];
+  const code = await m.run(argv).catch((e) => { term.write(`\n${e.message}\n`); return null; });
+  if (code !== null) term.write(`\n[exited ${code}; reload to start over]\n`);
+}
+</script>
+</body>
+</html>

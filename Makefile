@@ -50,6 +50,11 @@ stress: build
 	cd .dev/e2e && MINIPG=$(CURDIR)/$(OUT) go test -tags stress -count=1 -v -timeout 4h -run '$(STRESS_RUN)' ./...
 .PHONY: stress
 
+## Build the web demo into .zig-out/web: a shell with minipg, in the browser (needs Node 24 as NODE)
+web: assets/root-386.tar.xz
+	web/build.sh
+.PHONY: web
+
 ## Clean build outputs
 clean:
 	rm -rf $(DIST_DIR) .zig-out zig-out .zig-cache $(NAME)

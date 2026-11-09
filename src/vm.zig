@@ -56,6 +56,16 @@ pub fn exitCode(status: h9.Status) u8 {
     };
 }
 
+/// The backend machines run on. h9's `auto` never picks its native
+/// backend, which isn't a security boundary against a hostile guest. minipg
+/// runs only the image's own Postgres binaries, so where there's no
+/// hypervisor it asks for native, as Linux CI runners and containers need.
+pub fn backend() h9.vmm.BackendKind {
+    if (h9.vmm.whyUnavailable(.auto) == null) return .auto;
+    if (h9.vmm.whyUnavailable(.native) == null) return .native;
+    return .auto;
+}
+
 fn unavailable(err: anyerror) []const u8 {
     return h9.vmm.whyUnavailable(.auto) orelse @errorName(err);
 }
@@ -90,6 +100,7 @@ pub fn runServer(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r
 
 fn runServerMachine(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r: ServerRun) RunResult {
     const opts: h9.Machine.Options = .{
+        .backend = backend(),
         .linux_root = r.root.dir,
         .cwd = r.pgdb,
         .env = r.env,
@@ -153,6 +164,7 @@ fn runToolMachine(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.proces
     if (tty) try env.append(gpa, .{ .name = "TERM", .value = env_map.get("TERM") orelse "xterm" });
 
     const opts: h9.Machine.Options = .{
+        .backend = backend(),
         .linux_root = r.root.dir,
         .cwd = r.cwd,
         .env = env.items,

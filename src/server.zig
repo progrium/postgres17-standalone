@@ -159,7 +159,7 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         .log = log,
         .sig = &sig,
         .started = std.Io.Clock.real.now(io).toSeconds(),
-        .backend = @tagName(h9.vmm.BackendKind.auto),
+        .backend = @tagName(vm.backend()),
     };
     // The Linux build's Postgres puts its socket in the runtime directory,
     // where minipg and the tools it runs reach it.

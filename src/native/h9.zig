@@ -54,7 +54,7 @@ pub const Machine = struct {
 };
 
 pub const vmm = struct {
-    pub const BackendKind = enum { auto, process };
+    pub const BackendKind = enum { auto, native, process };
 
     pub fn whyUnavailable(kind: BackendKind) ?[]const u8 {
         _ = kind;
