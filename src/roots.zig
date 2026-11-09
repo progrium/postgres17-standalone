@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const native = @import("build_options").native;
 const paths = @import("paths.zig");
 
 /// The default major's root, an xz-compressed tarball.
@@ -16,6 +17,7 @@ const embedded_meta = @embedFile("root_meta");
 pub const host_arch: []const u8 = switch (builtin.cpu.arch) {
     .x86_64 => "amd64",
     .aarch64 => "arm64",
+    .x86 => "386",
     else => @compileError("minipg runs on x86_64 and aarch64 hosts only"),
 };
 
@@ -67,6 +69,8 @@ pub fn dirName(arena: std.mem.Allocator, digest: []const u8) ![]const u8 {
 /// The embedded root, unpacked into `roots_dir` if it isn't already.
 pub fn embedded(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, roots_dir: []const u8) !Root {
     const meta = try embeddedMeta(arena);
+    // The Linux build runs inside the root it describes.
+    if (native) return .{ .dir = "/", .meta = meta };
     const name = try dirName(arena, meta.digest);
     try std.Io.Dir.cwd().createDirPath(io, roots_dir);
     var cache = try std.Io.Dir.cwd().openDir(io, roots_dir, .{});
@@ -135,6 +139,7 @@ pub fn cached(ctx: anytype, name: []const u8) ?Root {
 pub fn list(ctx: anytype) ![]Root {
     const arena = ctx.arena;
     var out: std.ArrayList(Root) = .empty;
+    if (native) return out.items;
     var d = std.Io.Dir.cwd().openDir(ctx.io, ctx.dirs.roots, .{ .iterate = true }) catch return out.items;
     defer d.close(ctx.io);
     var it = d.iterate();
@@ -176,6 +181,11 @@ pub const Want = struct {
 /// is none and returns `error.NoRoot`.
 pub fn forMajor(ctx: anytype, major: u32, want: Want) !Root {
     const meta = try embeddedMeta(ctx.arena);
+    if (native) {
+        if (meta.major == major) return embedded(ctx.gpa, ctx.arena, ctx.io, ctx.dirs.roots);
+        ctx.warn("this minipg runs the Postgres {d} it's installed with, so it can't open Postgres {d} data", .{ meta.major, major });
+        return error.NoRoot;
+    }
     var best: ?Root = null;
     for (try list(ctx)) |r| {
         if (r.meta.major == major and (best == null or versionLess(best.?.meta.version, r.meta.version))) best = r;

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const h9 = @import("h9");
+const native = @import("build_options").native;
 const Ctx = @import("ctx.zig").Ctx;
 const pgdb_mod = @import("pgdb.zig");
 const paths = @import("paths.zig");
@@ -25,7 +26,8 @@ const Pgdb = pgdb_mod.Pgdb;
 pub const Options = struct {
     /// A port to use instead of the stored one; no fallback if it's taken.
     port: ?u16 = null,
-    /// Postgres's listen_addresses.
+    /// Postgres's listen_addresses, or `none` for its unix socket alone
+    /// (the Linux build).
     listen: []const u8 = "127.0.0.1",
     /// Where the full log goes, instead of the default log file.
     log_file: ?[]const u8 = null,
@@ -45,14 +47,16 @@ const Server = struct {
     pgdb: Pgdb,
     opts: Options,
     port: u16,
+    /// The directory of Postgres's unix socket, in the Linux build.
+    socket: []const u8 = "",
     root: roots.Root,
     log: *logwin.Log,
     sig: *host.Signals,
     started: i64,
     state: std.atomic.Value(State) = .init(.starting),
-    clients: std.atomic.Value(i64) = .init(-1),
+    clients: std.atomic.Value(i32) = .init(-1),
     /// Control connections holding the server open (minipg run).
-    holds: std.atomic.Value(i64) = .init(0),
+    holds: std.atomic.Value(i32) = .init(0),
     /// Set when the machine has exited.
     done: std.atomic.Value(bool) = .init(false),
     /// Set by the monitor once Postgres has accepted a login.
@@ -66,7 +70,7 @@ const Server = struct {
     }
 
     fn connectHost(s: *Server) []const u8 {
-        return net.dialHost(s.opts.listen);
+        return net.clientHost(s.opts.listen, s.socket);
     }
 
     fn status(s: *Server, arena: std.mem.Allocator) control.Status {
@@ -75,6 +79,7 @@ const Server = struct {
             .pid = std.c.getpid(),
             .port = s.port,
             .listen = s.opts.listen,
+            .socket = s.socket,
             .clients = s.clients.load(.acquire),
             .pg_version = s.root.meta.version,
             .backend = s.backend,
@@ -115,14 +120,16 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     if (opts.foreground) log.echo = std.Io.File.stdout();
 
     // The port: the one asked for, else the stored one if it's free, else
-    // any free one, so saved URLs usually keep working.
-    const port = if (opts.port) |pp| pp else blk: {
+    // any free one, so saved URLs usually keep working. With no TCP
+    // listener, it only names the socket.
+    const socket_only = net.socketOnly(opts.listen);
+    const port = if (opts.port) |pp| pp else if (socket_only) (if (p.config.port != 0) p.config.port else 5432) else blk: {
         if (p.config.port != 0 and net.portFree(opts.listen, p.config.port)) break :blk p.config.port;
         const free = net.freePort() catch return ctx.fail("no free port", .{});
         if (p.config.port != 0) log.note("port {d} is taken; using {d} instead", .{ p.config.port, free });
         break :blk free;
     };
-    if (opts.port != null and !net.portFree(opts.listen, port))
+    if (opts.port != null and !socket_only and !net.portFree(opts.listen, port))
         return ctx.fail("port {d} is in use", .{port});
 
     if (!std.mem.eql(u8, p.config.pg_arch, roots.host_arch) and p.config.pg_arch.len > 0)
@@ -154,6 +161,13 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         .started = std.Io.Clock.real.now(io).toSeconds(),
         .backend = @tagName(h9.vmm.BackendKind.auto),
     };
+    // The Linux build's Postgres puts its socket in the runtime directory,
+    // where minipg and the tools it runs reach it.
+    if (native) {
+        s.socket = runtime;
+        s.backend = "process";
+        socketOwner(runtime);
+    }
 
     // The control socket, then run.json, which points at it.
     const sock_path = try control.socketPath(arena, runtime);
@@ -168,6 +182,7 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         .pid = std.c.getpid(),
         .port = port,
         .listen = opts.listen,
+        .socket = s.socket,
         .control = sock_path,
         .protocol = control.protocol,
         .version = ctx.version,
@@ -180,15 +195,25 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     const monitor_thread = try std.Thread.spawn(.{}, monitor, .{&s});
 
     // The machine's environment and Postgres's command line.
-    const initializing = !p.initialized(arena, io);
+    var initializing = !p.initialized(arena, io);
     if (initializing) {
         log.note("initializing a Postgres {s} cluster in {s}", .{ root.meta.version, p.path });
+        // A template seeds in a machine of its own; then Postgres starts
+        // as it would on an initialized cluster.
+        if (templateFor(ctx, p, root) != null) {
+            const code = try seed(ctx, p, root, log, &sig);
+            if (code != 0) {
+                log.note("initializing {s} failed (exit {d}); see {s}", .{ p.path, code, log_path });
+                return code;
+            }
+            initializing = false;
+        }
     } else {
         const data_major = p.dataMajor(arena, io) catch 0;
         if (data_major != root.meta.major)
             return ctx.fail("{s} holds Postgres {d} data but its root is Postgres {d}", .{ p.path, data_major, root.meta.major });
     }
-    const extra = try machineEnv(ctx, p, root, port, initializing);
+    const extra = try machineEnv(ctx, p, root, port, initializing, if (native) runtime else null);
     const env = try vm.environment(arena, root.meta, extra);
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -196,7 +221,7 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         "bash",                                                                "-c",
         supervisor,                                                            "minipg-server",
         "postgres",                                                            "-c",
-        try std.fmt.allocPrint(arena, "listen_addresses={s}", .{opts.listen}), "-c",
+        try std.fmt.allocPrint(arena, "listen_addresses={s}", .{if (socket_only) "" else opts.listen}), "-c",
         try std.fmt.allocPrint(arena, "port={d}", .{port}),
         // The trimmed root has no LLVM, so JIT is never available.
                            "-c",
@@ -208,12 +233,17 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
             .sub_path = trust_hba,
             .data = "# Written by minipg serve --trust; removed when it stops.\nlocal all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n",
         });
-        try argv.appendSlice(arena, &.{ "-c", "hba_file=" ++ vm.guest_pgdb ++ "/.trust_hba.conf" });
+        try argv.appendSlice(arena, &.{ "-c", try std.fmt.allocPrint(arena, "hba_file={s}/.trust_hba.conf", .{try vm.guestPgdb(arena, p.path)}) });
     }
     defer if (opts.trust) std.Io.Dir.cwd().deleteFile(io, trust_hba) catch {};
+
+    if (native) try argv.appendSlice(arena, &.{ "-c", try std.fmt.allocPrint(arena, "unix_socket_directories={s}", .{runtime}) });
     try argv.appendSlice(arena, opts.postgres_args);
 
-    log.note("starting Postgres {s} for {s} on {s}:{d}", .{ root.meta.version, p.path, opts.listen, port });
+    if (socket_only)
+        log.note("starting Postgres {s} for {s} on {s}/.s.PGSQL.{d}", .{ root.meta.version, p.path, runtime, port })
+    else
+        log.note("starting Postgres {s} for {s} on {s}:{d}", .{ root.meta.version, p.path, opts.listen, port });
     const result = vm.runServer(ctx.gpa, io, arena, .{
         .root = root,
         .pgdb = p.path,
@@ -263,6 +293,17 @@ const supervisor =
     \\wait "$pg"
 ;
 
+/// In the Linux build as root, docker-entrypoint.sh runs Postgres as the
+/// image's postgres user, which must be able to create its socket in the
+/// runtime directory: give the directory to it. It stays private.
+fn socketOwner(dir: []const u8) void {
+    if (!native or std.c.geteuid() != 0) return;
+    const pw = std.c.getpwnam("postgres") orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{dir}) catch return;
+    _ = std.c.fchownat(std.c.AT.FDCWD, z, pw.uid, pw.gid, 0);
+}
+
 /// Asks the supervisor to stop Postgres. `ctx` is the pipe's write end + 1.
 fn writeStop(ctx: *anyopaque) void {
     const fd: std.posix.fd_t = @intCast(@intFromPtr(ctx) - 1);
@@ -272,13 +313,17 @@ fn writeStop(ctx: *anyopaque) void {
 /// The server machine's environment beyond the image's: PGDATA and PGPORT,
 /// and for a cluster that isn't initialized yet, what docker-entrypoint.sh
 /// initializes it with.
-fn machineEnv(ctx: Ctx, p: Pgdb, root: roots.Root, port: u16, initializing: bool) ![]const h9.EnvVar {
+fn machineEnv(ctx: Ctx, p: Pgdb, root: roots.Root, port: u16, initializing: bool, socket: ?[]const u8) ![]const h9.EnvVar {
     const arena = ctx.arena;
     var extra: std.ArrayList(h9.EnvVar) = .empty;
     try extra.appendSlice(arena, &.{
-        .{ .name = "PGDATA", .value = vm.guest_pgdata },
+        .{ .name = "PGDATA", .value = try vm.guestPgdata(arena, p.path) },
         .{ .name = "PGPORT", .value = try std.fmt.allocPrint(arena, "{d}", .{port}) },
     });
+    // Postgres's arguments, unix_socket_directories among them, reach
+    // docker-entrypoint.sh's temporary server too, so its psql needs the
+    // same directory.
+    if (socket) |dir| try extra.append(arena, .{ .name = "PGHOST", .value = dir });
     if (ctx.getenv("TZ")) |tz| try extra.append(arena, .{ .name = "TZ", .value = tz });
     if (!initializing) return extra.items;
     var initdb_args: []const u8 = ctx.getenv("POSTGRES_INITDB_ARGS") orelse "";
@@ -321,6 +366,73 @@ const init_script =
     \\docker_temp_server_stop
 ;
 
+/// The Linux build's init from a template: a cluster `minipg init` made at
+/// build time with the same root, copied in, given this .pgdb's password,
+/// and its database created. initdb takes half a minute on h9's web host;
+/// this takes a few seconds.
+const template_script =
+    \\set -Eeo pipefail
+    \\source /usr/local/bin/docker-entrypoint.sh
+    \\docker_setup_env
+    \\docker_create_db_directories
+    \\if [ "$(id -u)" = 0 ]; then exec gosu postgres bash -c "$MINIPG_INIT" minipg-init; fi
+    \\docker_verify_minimum_env
+    \\cp -R "$MINIPG_TEMPLATE"/. "$PGDATA"/
+    \\chmod 700 "$PGDATA"
+    \\export PGPASSWORD="${PGPASSWORD:-$POSTGRES_PASSWORD}"
+    \\docker_temp_server_start postgres
+    \\docker_process_sql --dbname postgres --set pw="$POSTGRES_PASSWORD" <<<"ALTER ROLE \"$POSTGRES_USER\" PASSWORD :'pw'"
+    \\docker_setup_db
+    \\docker_process_init_files /docker-entrypoint-initdb.d/*
+    \\docker_temp_server_stop
+;
+
+/// Where the Linux build looks for its template cluster, unless
+/// MINIPG_TEMPLATE names another.
+const default_template = "/usr/local/share/minipg/template";
+
+/// The template cluster to initialize `p` from, if there is one that fits:
+/// the Linux build only, a template of the root's major, the template's
+/// superuser, and no initdb settings it couldn't have had.
+fn templateFor(ctx: Ctx, p: Pgdb, root: roots.Root) ?[]const u8 {
+    if (!native) return null;
+    if (!std.mem.eql(u8, p.config.user, "postgres")) return null;
+    if (ctx.getenv("POSTGRES_INITDB_ARGS") != null or ctx.getenv("POSTGRES_INITDB_WALDIR") != null) return null;
+    const dir = ctx.getenv("MINIPG_TEMPLATE") orelse default_template;
+    const v = std.fmt.allocPrint(ctx.arena, "{s}/PG_VERSION", .{dir}) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(ctx.io, v, ctx.arena, .limited(64)) catch return null;
+    const major = std.fmt.parseInt(u32, std.mem.trim(u8, text, " \r\n"), 10) catch return null;
+    return if (major == root.meta.major) dir else null;
+}
+
+/// Initializes `p`'s cluster in a machine of its own: from a template when
+/// templateFor finds one, else with initdb. Returns the exit code.
+fn seed(ctx: Ctx, p: Pgdb, root: roots.Root, log: *logwin.Log, sig: *host.Signals) !u8 {
+    const arena = ctx.arena;
+    const tmpl = templateFor(ctx, p, root);
+    const script = if (tmpl != null) template_script else init_script;
+    var extra: std.ArrayList(h9.EnvVar) = .empty;
+    try extra.appendSlice(arena, try machineEnv(ctx, p, root, 5432, true, null));
+    try extra.append(arena, .{ .name = "MINIPG_INIT", .value = script });
+    if (tmpl) |t| try extra.append(arena, .{ .name = "MINIPG_TEMPLATE", .value = t });
+    const env = try vm.environment(arena, root.meta, extra.items);
+    const result = vm.runServer(ctx.gpa, ctx.io, arena, .{
+        .root = root,
+        .pgdb = p.path,
+        .env = env,
+        .prog = "/bin/bash",
+        .argv = &.{ "bash", "-c", script, "minipg-init" },
+        .log = &log.interface,
+        .signals = &sig.machine,
+    });
+    if (result.stuck) std.process.exit(1);
+    const st = result.status orelse {
+        log.note("{s}", .{result.err_msg});
+        return 1;
+    };
+    return vm.exitCode(st);
+}
+
 /// Initializes a .pgdb's cluster without serving it (init). Returns the
 /// exit code; the log goes to the .pgdb's log file.
 pub fn initialize(ctx: Ctx, p: Pgdb) !u8 {
@@ -340,29 +452,10 @@ pub fn initialize(ctx: Ctx, p: Pgdb) !u8 {
         return ctx.fail("log file {s}: {t}", .{ log_path, err });
     log.note("initializing a Postgres {s} cluster in {s}", .{ root.meta.version, p.path });
 
-    var extra: std.ArrayList(h9.EnvVar) = .empty;
-    try extra.appendSlice(arena, try machineEnv(ctx, p, root, 5432, true));
-    try extra.append(arena, .{ .name = "MINIPG_INIT", .value = init_script });
-    const env = try vm.environment(arena, root.meta, extra.items);
-
     var sig: host.Signals = undefined;
     try sig.init(io, .server, &log.interface);
     defer sig.deinit();
-    const result = vm.runServer(ctx.gpa, io, arena, .{
-        .root = root,
-        .pgdb = p.path,
-        .env = env,
-        .prog = "/bin/bash",
-        .argv = &.{ "bash", "-c", init_script, "minipg-init" },
-        .log = &log.interface,
-        .signals = &sig.machine,
-    });
-    if (result.stuck) std.process.exit(1);
-    const st = result.status orelse {
-        log.note("{s}", .{result.err_msg});
-        return 1;
-    };
-    const code = vm.exitCode(st);
+    const code = try seed(ctx, p, root, log, &sig);
     if (code != 0) return code;
     var s: Server = .{ .ctx = ctx, .pgdb = p, .opts = .{}, .port = 0, .root = root, .log = log, .sig = &sig, .started = 0 };
     s.recordOpened();
@@ -416,7 +509,7 @@ fn monitor(s: *Server) void {
         if (c) |cc| {
             if (cc.scalar(arena_state.allocator(), sql)) |v| {
                 const n = std.fmt.parseInt(i64, v orelse "0", 10) catch 0;
-                s.clients.store(n, .release);
+                s.clients.store(std.math.cast(i32, n) orelse std.math.maxInt(i32), .release);
             } else |_| {
                 cc.close();
                 conn = null;

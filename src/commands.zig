@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const h9 = @import("h9");
+const native = @import("build_options").native;
 const Ctx = @import("ctx.zig").Ctx;
 const cli = @import("cli.zig");
 const pgdb_mod = @import("pgdb.zig");
@@ -42,6 +43,9 @@ fn newConfig(ctx: Ctx, args: cli.Args, path: []const u8) !pgdb_mod.Config {
     const meta = try roots.embeddedMeta(ctx.arena);
     const port = if (args.flag(&.{"port"})) |v|
         std.fmt.parseInt(u16, v, 10) catch return error.BadPort
+    else if (native)
+        // Without TCP (h9's web host), the port only names the socket.
+        net.freePort() catch 5432
     else
         try net.freePort();
     return .{
@@ -113,7 +117,7 @@ pub fn serve(ctx: Ctx, args: cli.Args) !u8 {
     const path = args.pgdb() orelse return usageError(ctx, "serve needs a .pgdb path", .{});
     const p = openPgdb(ctx, path) orelse return 1;
     var opts: server.Options = .{
-        .listen = args.flag(&.{"listen"}) orelse "127.0.0.1",
+        .listen = args.flag(&.{"listen"}) orelse if (native and !net.tcpAvailable()) "none" else "127.0.0.1",
         .log_file = args.flag(&.{"log"}),
         .trust = args.has(&.{"trust"}),
         .foreground = !args.has(&.{"background"}),
@@ -121,7 +125,9 @@ pub fn serve(ctx: Ctx, args: cli.Args) !u8 {
     };
     if (args.flag(&.{ "p", "port" })) |v| opts.port = std.fmt.parseInt(u16, v, 10) catch return usageError(ctx, "-p takes a port number", .{});
     if (args.flag(&.{"idle"})) |v| opts.idle_timeout = std.fmt.parseInt(i64, v, 10) catch return usageError(ctx, "--idle takes seconds", .{});
-    if (opts.trust and !net.isLoopback(opts.listen))
+    if (net.socketOnly(opts.listen) and !native)
+        return ctx.fail("--listen none needs the Linux build of minipg, whose Postgres socket is on this host", .{});
+    if (opts.trust and !net.socketOnly(opts.listen) and !net.isLoopback(opts.listen))
         return ctx.fail("--trust lets anyone who can reach the port in without a password, so it only works with a loopback --listen", .{});
     if (opts.log_file) |l| opts.log_file = try pgdb_mod.absolute(ctx.arena, ctx.io, l);
     return server.serve(ctx, p, opts);
@@ -158,7 +164,10 @@ pub fn status(ctx: Ctx, args: cli.Args) !u8 {
     const now = std.Io.Clock.real.now(ctx.io).toSeconds();
     try w.print("{s}: {s}\n", .{ path, if (std.mem.eql(u8, st.state, "ready")) "running" else st.state });
     try w.print("  postgres  {s}\n", .{st.pg_version});
-    try w.print("  listen    {s}:{d}\n", .{ st.listen, st.port });
+    if (net.socketOnly(st.listen))
+        try w.print("  listen    {s}/.s.PGSQL.{d}\n", .{ st.socket, st.port })
+    else
+        try w.print("  listen    {s}:{d}\n", .{ st.listen, st.port });
     try w.print("  pid       {d}\n", .{st.pid});
     if (st.clients >= 0) try w.print("  clients   {d}\n", .{st.clients});
     try w.print("  uptime    {d}s\n", .{now - st.started});
@@ -186,6 +195,11 @@ const Conn = struct {
     database: []const u8,
 
     fn url(c: Conn, arena: std.mem.Allocator) ![]const u8 {
+        // A unix socket's directory goes in the query, as libpq takes it.
+        if (c.host.len > 0 and c.host[0] == '/')
+            return std.fmt.allocPrint(arena, "postgres://{s}:{s}@/{s}?host={s}&port={d}", .{
+                try escape(arena, c.user), try escape(arena, c.password), try escape(arena, c.database), try escape(arena, c.host), c.port,
+            });
         const h = if (std.mem.indexOfScalar(u8, c.host, ':') != null) try std.fmt.allocPrint(arena, "[{s}]", .{c.host}) else c.host;
         return std.fmt.allocPrint(arena, "postgres://{s}:{s}@{s}:{d}/{s}", .{
             try escape(arena, c.user), try escape(arena, c.password), h, c.port, try escape(arena, c.database),
@@ -207,7 +221,7 @@ const Conn = struct {
 /// stored one.
 fn connFor(args: cli.Args, p: Pgdb, r: ?client.Running) Conn {
     return .{
-        .host = if (r) |rr| net.dialHost(rr.info.listen) else "127.0.0.1",
+        .host = if (r) |rr| net.clientHost(rr.info.listen, rr.info.socket) else "127.0.0.1",
         .port = if (r) |rr| rr.info.port else p.config.port,
         .user = p.config.user,
         .password = p.config.password,
@@ -310,7 +324,7 @@ pub fn exec(ctx: Ctx, args: cli.Args) !u8 {
 /// A host-side admin connection to the .pgdb's server, as its superuser.
 fn admin(ctx: Ctx, p: Pgdb, r: client.Running, database: []const u8) !*pgwire.Conn {
     return pgwire.Conn.connect(ctx.gpa, ctx.io, .{
-        .host = net.dialHost(r.info.listen),
+        .host = net.clientHost(r.info.listen, r.info.socket),
         .port = r.info.port,
         .user = p.config.user,
         .password = p.config.password,
@@ -582,6 +596,11 @@ pub fn versions(ctx: Ctx, args: cli.Args) !u8 {
     var buf: [1024]u8 = undefined;
     var out = ctx.stdout(&buf);
     const w = &out.interface;
+    if (native) {
+        try w.print("installed {s:<8} {s}\n", .{ meta.version, meta.digest });
+        try w.flush();
+        return 0;
+    }
     try w.print("embedded  {s:<8} {s}\n", .{ meta.version, meta.digest });
     for (try roots.list(ctx)) |r| {
         if (std.mem.eql(u8, r.meta.digest, meta.digest)) continue;
@@ -596,6 +615,7 @@ pub fn fetch(ctx: Ctx, args: cli.Args) !u8 {
     const m = args.pgdb() orelse return usageError(ctx, "fetch needs a Postgres major, such as 17", .{});
     const major = std.fmt.parseInt(u32, m, 10) catch return usageError(ctx, "fetch needs a Postgres major, such as 17", .{});
     if (ctx.getenv("MINIPG_OFFLINE") != null) return ctx.fail("MINIPG_OFFLINE is set", .{});
+    if (native) return ctx.fail("this minipg runs the Postgres {d} it's installed with, and can't download others", .{(try roots.embeddedMeta(ctx.arena)).major});
     const r = @import("registry.zig").pull(ctx, major) catch |err| return ctx.fail("downloading Postgres {d}: {s}", .{ major, @import("registry.zig").describe(err) });
     var buf: [256]u8 = undefined;
     var out = ctx.stdout(&buf);
@@ -606,6 +626,7 @@ pub fn fetch(ctx: Ctx, args: cli.Args) !u8 {
 
 pub fn prune(ctx: Ctx, args: cli.Args) !u8 {
     _ = args;
+    if (native) return 0;
     const meta = try roots.embeddedMeta(ctx.arena);
     const keep = try roots.dirName(ctx.arena, meta.digest);
     var d = std.Io.Dir.cwd().openDir(ctx.io, ctx.dirs.roots, .{ .iterate = true }) catch return 0;

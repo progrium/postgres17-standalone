@@ -27,6 +27,9 @@ pub const RunInfo = struct {
     pid: i32,
     port: u16,
     listen: []const u8,
+    /// The directory of Postgres's unix socket, when minipg can reach it
+    /// (the Linux build); empty otherwise.
+    socket: []const u8 = "",
     control: []const u8,
     protocol: u32,
     version: []const u8,
@@ -39,6 +42,7 @@ pub const Status = struct {
     pid: i32,
     port: u16,
     listen: []const u8,
+    socket: []const u8 = "",
     /// Client connections, -1 before the server is ready.
     clients: i64,
     pg_version: []const u8,
