@@ -15,6 +15,8 @@ minipg embeds Docker Hub's `postgres:18-alpine` image and runs it with [hyper9](
 
 > **Early.** h9 is a research prototype and its Linux personality is young. See [Known limits](#known-limits) before trusting it with data you can't recreate.
 
+The **[manual](MANUAL.md)** is the full guide: concepts, everyday tasks, backup and restore, Postgres versions, CI, performance, durability, troubleshooting, and a reference for every command, variable, and file.
+
 ## The .pgdb
 
 A `.pgdb` is a directory:
@@ -26,9 +28,9 @@ app.pgdb/
   .lock         held by the server while it runs
 ```
 
-Data, config, credentials and the Postgres version live inside it; nothing is written next to it. A stopped `.pgdb` can be copied like any directory. While a server runs, use `pg_dump` (`minipg exec app.pgdb -- pg_dump`), since a raw copy isn't guaranteed consistent.
+Data, config, credentials, and the Postgres version live inside it; nothing is written next to it. A stopped `.pgdb` can be copied like any directory. While a server runs, use `pg_dump` (`minipg exec app.pgdb -- pg_dump`), since a raw copy isn't guaranteed consistent.
 
-`minipg.toml` records the layout `format`, the Postgres major, variant (alpine), arch and image digest, the superuser and its generated password, the default database (named after the file: `app.pgdb` has `app`), and the preferred port, picked at init.
+`minipg.toml` records the layout `format`, the Postgres major, variant (alpine), arch, and image digest, the superuser and its generated password, the default database (named after the file: `app.pgdb` has `app`), and the preferred port, picked at init.
 
 New clusters use Postgres's builtin `C.UTF-8` locale, which sorts the same on every platform and never changes between versions, so indexes on text can't be invalidated by a libc update.
 
@@ -52,17 +54,17 @@ Every command takes the `.pgdb` first; a bare path is shorthand for `shell`. `-d
 | `restore <pgdb> [FILE]` | Restore a plain SQL or custom-format dump from FILE or stdin; stops at the first error |
 | `dbs <pgdb>` | List databases, the default marked `*` |
 | `create <pgdb> NAME`, `drop <pgdb> NAME` | Create or drop a database; the default can't be dropped |
-| `default <pgdb> [NAME]` | Show or set the default database (what `url`, `shell` and the rest use) |
+| `default <pgdb> [NAME]` | Show or set the default database (what `url`, `shell`, and the rest use) |
 | `passwd <pgdb>` | Give the superuser a new generated password (or `POSTGRES_PASSWORD`) and save it |
 | `versions` | Postgres versions embedded and downloaded |
 | `fetch MAJOR` | Download a Postgres major's root (`postgres:MAJOR-alpine`) |
 | `prune` | Remove downloaded roots; they come back on demand |
 
-`shell`, `url` and the bare form create a missing `.pgdb` with defaults. `init` takes `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` as defaults, and passes `POSTGRES_INITDB_ARGS`, `POSTGRES_INITDB_WALDIR` and `TZ` through to the image as Docker would.
+`shell`, `url`, `env`, `run`, `restore`, and the bare form create a missing `.pgdb` with defaults. `init` takes `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` as defaults, and passes `POSTGRES_INITDB_ARGS`, `POSTGRES_INITDB_WALDIR`, and `TZ` through to the image as Docker would.
 
 ### Other Postgres majors
 
-The binary embeds one major (18 by default). `init --pg 17` makes a `.pgdb` on another, downloading `postgres:17-alpine` from Docker Hub for this host's arch, trimming it as the build does, and caching it by digest. A `.pgdb` remembers its major, and opening one whose root isn't cached downloads it again. `MINIPG_OFFLINE=1` turns downloads off, and `MINIPG_REGISTRY` names another registry (`host`, or `host/repository`). Downloads honor `HTTPS_PROXY`, `NO_PROXY` and `SSL_CERT_FILE`.
+The binary embeds one major (18 by default). `init --pg 17` makes a `.pgdb` on another, downloading `postgres:17-alpine` from Docker Hub for this host's arch, trimming it as the build does, and caching it by digest. A `.pgdb` remembers its major, and opening one whose root isn't cached downloads it again. `MINIPG_OFFLINE=1` turns downloads off, and `MINIPG_REGISTRY` names another registry (`host`, or `host/repository`). Downloads honor `HTTPS_PROXY`, `NO_PROXY`, and `SSL_CERT_FILE`.
 
 ### Servers
 
@@ -70,7 +72,7 @@ Exactly one process runs Postgres for a `.pgdb`, enforced by the lock. Commands 
 
 Postgres listens on a host port directly, on `127.0.0.1` unless `--listen` says otherwise. The port stored at init is used when it's free; otherwise the server picks another, and `url` reports the one in use. Apps authenticate with SCRAM and the generated password, loopback included (initdb's default would trust it). `serve --trust` lets loopback clients in without one, and is refused with a non-loopback `--listen`.
 
-psql, pg_dump and the other tools run in their own short-lived h9 machine (about 90 ms to start) over the same root, and connect to the server over loopback. Their working directory is yours, so `pg_dump -f dump.sql` writes where you are.
+psql, pg_dump, and the other tools run in their own short-lived h9 machine (about 90 ms to start) over the same root, and connect to the server over loopback. Their working directory is yours, so `pg_dump -f dump.sql` writes where you are.
 
 ### Files outside the .pgdb
 
@@ -110,7 +112,7 @@ minipg run test.pgdb -- go test ./...
 
 ## Building
 
-Requires [Zig 0.16](https://ziglang.org/download/), and for the root `curl`, `jq`, `tar` and `xz`. hyper9 is a git submodule, since it can't be fetched as a Zig package yet:
+Requires [Zig 0.16](https://ziglang.org/download/), and for the root `curl`, `jq`, `tar`, and `xz`. hyper9 is a git submodule, since it can't be fetched as a Zig package yet:
 
 ```sh
 git submodule update --init
@@ -121,7 +123,7 @@ make build PG_MAJOR=17           # embed another major
 make dist VERSION=v0.4           # dist/minipg_v0.4_<os>_<arch>.zip
 ```
 
-[scripts/root.sh](scripts/root.sh) pulls the image from Docker Hub's registry, drops what a server doesn't need (LLVM for JIT, headers, docs), and records the image's digest, version and ENV beside the tarball. JIT is therefore unavailable, and minipg sets `jit=off`. macOS builds have to be made on a Mac (for the SDK's Hypervisor framework).
+[scripts/root.sh](scripts/root.sh) pulls the image from Docker Hub's registry, drops what a server doesn't need (LLVM for JIT, headers, docs), and records the image's digest, version, and ENV beside the tarball. JIT is therefore unavailable, and minipg sets `jit=off`. macOS builds have to be made on a Mac (for the SDK's Hypervisor framework).
 
 ## Testing
 
