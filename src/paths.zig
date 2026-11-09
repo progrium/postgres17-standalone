@@ -75,8 +75,10 @@ pub fn key(arena: std.mem.Allocator, dir: []const u8) ![]const u8 {
         h.update(std.mem.asBytes(&st.ino));
         return std.fmt.allocPrint(arena, "{x:0>16}", .{h.final()});
     }
+    // fstatat, not stat: Zig 0.16's std.c.stat names a private.stat it
+    // never declares, so it fails to compile for aarch64-macos.
     var st: std.c.Stat = undefined;
-    if (std.c.stat(z, &st) != 0) return error.FileNotFound;
+    if (std.c.fstatat(std.c.AT.FDCWD, z, &st, 0) != 0) return error.FileNotFound;
     h.update(std.mem.asBytes(&st.dev));
     h.update(std.mem.asBytes(&st.ino));
     return std.fmt.allocPrint(arena, "{x:0>16}", .{h.final()});
