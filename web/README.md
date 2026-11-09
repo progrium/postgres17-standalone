@@ -27,3 +27,7 @@ plus h9.wasm.
 
 `minipg init` copies the template rather than running initdb, which
 takes about 9s instead of 31s under v86.
+
+`.github/workflows/pages.yml` builds this on every push to main, tests
+it in Chromium with `web/test.mjs`, and publishes it under `demo/` of
+the project page (`site/index.html`) on GitHub Pages.

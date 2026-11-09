@@ -33,6 +33,8 @@
 import { createMachine, haveJSPI } from './h9-web.js';
 
 const { Terminal, FitAddon: { FitAddon } } = window;
+// Embedded in the project page, which already says what this is.
+if (window !== window.top) document.querySelector('header > span:not(#status)')?.remove();
 const status = document.getElementById('status');
 const dark = matchMedia('(prefers-color-scheme: dark)').matches;
 const term = new Terminal({
