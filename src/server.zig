@@ -51,6 +51,8 @@ const Server = struct {
     started: i64,
     state: std.atomic.Value(State) = .init(.starting),
     clients: std.atomic.Value(i64) = .init(-1),
+    /// Control connections holding the server open (minipg run).
+    holds: std.atomic.Value(i64) = .init(0),
     /// Set when the machine has exited.
     done: std.atomic.Value(bool) = .init(false),
     /// Set by the monitor once Postgres has accepted a login.
@@ -284,6 +286,11 @@ fn machineEnv(ctx: Ctx, p: Pgdb, root: roots.Root, port: u16, initializing: bool
     // every libc and never changes, so collations can't drift.
     if (root.meta.major >= 17 and std.mem.indexOf(u8, initdb_args, "locale") == null)
         initdb_args = try std.fmt.allocPrint(arena, "--locale-provider=builtin --builtin-locale=C.UTF-8 {s}", .{initdb_args});
+    // initdb trusts loopback by default, and host connections reach the
+    // guest over loopback, so without this the password guards nothing.
+    // The unix socket is only reachable inside the machine.
+    if (std.mem.indexOf(u8, initdb_args, "--auth") == null)
+        initdb_args = try std.fmt.allocPrint(arena, "--auth-host=scram-sha-256 --auth-local=trust {s}", .{initdb_args});
     try extra.appendSlice(arena, &.{
         .{ .name = "POSTGRES_USER", .value = p.config.user },
         .{ .name = "POSTGRES_PASSWORD", .value = p.config.password },
@@ -369,7 +376,7 @@ fn monitor(s: *Server) void {
     const io = ctx.io;
     var arena_state: std.heap.ArenaAllocator = .init(ctx.gpa);
     defer arena_state.deinit();
-    const opts: pgwire.Options = .{
+    var opts: pgwire.Options = .{
         .host = s.connectHost(),
         .port = s.port,
         .user = s.pgdb.config.user,
@@ -391,6 +398,7 @@ fn monitor(s: *Server) void {
     if (s.state.cmpxchgStrong(.starting, .ready, .acq_rel, .acquire) == null) {
         s.log.note("ready on {s}:{d}", .{ s.opts.listen, s.port });
         s.recordOpened();
+        if (conn) |c| checkCollations(s, c, arena_state.allocator());
     }
 
     var idle_since: ?i64 = null;
@@ -399,6 +407,10 @@ fn monitor(s: *Server) void {
         _ = arena_state.reset(.retain_capacity);
         const c = conn orelse blk: {
             conn = pgwire.Conn.connect(ctx.gpa, io, opts) catch null;
+            if (conn == null) {
+                // passwd may have rotated the password.
+                if (pgdb_mod.open(s.ctx.arena, io, s.pgdb.path)) |fresh| opts.password = fresh.config.password else |_| {}
+            }
             break :blk conn;
         };
         if (c) |cc| {
@@ -412,7 +424,7 @@ fn monitor(s: *Server) void {
         }
         const now = std.Io.Clock.awake.now(io).toSeconds();
         if (s.opts.idle_timeout > 0 and s.state.load(.acquire) == .ready) {
-            if (s.clients.load(.acquire) == 0) {
+            if (s.clients.load(.acquire) == 0 and s.holds.load(.acquire) == 0) {
                 const since = idle_since orelse now;
                 idle_since = since;
                 if (now - since >= s.opts.idle_timeout) {
@@ -428,6 +440,21 @@ fn monitor(s: *Server) void {
             if (s.done.load(.acquire)) return;
             io.sleep(.fromMilliseconds(100), .awake) catch return;
         }
+    }
+}
+
+/// Warns about databases whose collation version no longer matches the
+/// library's, which happens when a minor upgrade brings a new libc or ICU
+/// to a cluster that doesn't use the builtin provider: indexes on text may
+/// then be out of order until rebuilt.
+fn checkCollations(s: *Server, c: *pgwire.Conn, arena: std.mem.Allocator) void {
+    const rows = c.query(arena,
+        \\select datname, datcollversion, pg_database_collation_actual_version(oid)
+        \\from pg_database
+        \\where datallowconn and datcollversion is distinct from pg_database_collation_actual_version(oid)
+    ) catch return;
+    for (rows) |row| {
+        s.log.note("warning: database {s} was created with collation version {s}, and this Postgres has {s}; run REINDEX DATABASE and ALTER DATABASE ... REFRESH COLLATION VERSION in it", .{ row[0] orelse "?", row[1] orelse "(none)", row[2] orelse "(none)" });
     }
 }
 
@@ -482,11 +509,11 @@ fn handle(s: *Server, conn: std.Io.net.Stream) void {
     var w = conn.writer(io, &wbuf);
     const out = &w.interface;
     const line = (r.interface.takeDelimiter('\n') catch return) orelse return;
-    handleRequest(s, arena, line, out) catch {};
+    handleRequest(s, arena, line, out, conn.socket.handle) catch {};
     out.flush() catch {};
 }
 
-fn handleRequest(s: *Server, arena: std.mem.Allocator, line: []const u8, out: *std.Io.Writer) !void {
+fn handleRequest(s: *Server, arena: std.mem.Allocator, line: []const u8, out: *std.Io.Writer, conn_fd: std.posix.fd_t) !void {
     const io = s.ctx.io;
     const req = control.parseRequest(line) orelse return out.writeAll("error malformed request\n");
     if (req.version != control.protocol)
@@ -501,6 +528,17 @@ fn handleRequest(s: *Server, arena: std.mem.Allocator, line: []const u8, out: *s
         s.log.note("stop requested", .{});
         s.state.store(.stopping, .release);
         s.sig.request();
+    } else if (std.mem.eql(u8, cmd, "hold")) {
+        _ = s.holds.fetchAdd(1, .acq_rel);
+        defer _ = s.holds.fetchSub(1, .acq_rel);
+        try out.writeAll("ok\n");
+        try out.flush();
+        // Until the client hangs up.
+        var b: [1]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(conn_fd, &b) catch break;
+            if (n == 0) break;
+        }
     } else if (std.mem.eql(u8, cmd, "clients")) {
         try out.print("ok\n{d}\n", .{s.clients.load(.acquire)});
     } else if (std.mem.eql(u8, cmd, "logs")) {

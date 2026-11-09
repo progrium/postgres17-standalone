@@ -7,6 +7,7 @@
 //! connects. That server stops after MINIPG_IDLE seconds without clients.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Ctx = @import("ctx.zig").Ctx;
 const pgdb_mod = @import("pgdb.zig");
 const paths = @import("paths.zig");
@@ -36,11 +37,35 @@ pub fn find(ctx: Ctx, p: Pgdb) !?Running {
     while (true) : (tries += 1) {
         if (!pgdb_mod.locked(ctx.arena, ctx.io, p)) return null;
         if (control.readRunInfo(ctx.arena, ctx.io, runtime)) |info| {
-            return .{ .info = info, .runtime = runtime };
-        } else |_| {}
-        if (tries > 100) return error.NoRunInfo;
+            // A killed server's guest processes can hold the lock for a few
+            // seconds after it's gone; wait them out.
+            if (alive(info.pid)) return .{ .info = info, .runtime = runtime };
+            if (tries > 400) return error.StaleLock;
+        } else |_| {
+            if (tries > 100) return error.NoRunInfo;
+        }
         try ctx.io.sleep(.fromMilliseconds(50), .awake);
     }
+}
+
+/// Whether `pid` is a live process: not gone, and not a zombie waiting
+/// for a parent to reap it.
+fn alive(pid: i32) bool {
+    if (pid <= 0) return true;
+    if (std.c.kill(pid, @enumFromInt(0)) != 0 and std.c._errno().* == @intFromEnum(std.c.E.SRCH)) return false;
+    if (builtin.os.tag != .linux) return true;
+    var path: [32:0]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid}) catch return true;
+    const fd = std.c.open(z, .{});
+    if (fd < 0) return true;
+    defer _ = std.c.close(fd);
+    var buf: [512]u8 = undefined;
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) return true;
+    // "pid (comm) S ...": the state follows the last ')'.
+    const stat = buf[0..@intCast(n)];
+    const i = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return true;
+    return !(i + 2 < stat.len and stat[i + 2] == 'Z');
 }
 
 /// Asks a running server for its status.

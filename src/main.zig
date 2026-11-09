@@ -76,8 +76,19 @@ fn run(ctx: Ctx, args: cli.Args) !u8 {
         .url => commands.url(ctx, args),
         .logs => commands.logs(ctx, args),
         .exec => commands.exec(ctx, args),
+        .env => commands.envCmd(ctx, args),
+        .run => commands.run(ctx, args),
+        .dump => commands.dump(ctx, args),
+        .restore => commands.restore(ctx, args),
+        .dbs => commands.dbs(ctx, args),
+        .create => commands.create(ctx, args),
+        .drop => commands.drop(ctx, args),
+        .default => commands.default(ctx, args),
+        .passwd => commands.passwd(ctx, args),
+        .versions => commands.versions(ctx, args),
+        .fetch => commands.fetch(ctx, args),
+        .prune => commands.prune(ctx, args),
         .help, .version => unreachable,
-        else => commands.usageError(ctx, "{t} isn't implemented yet", .{args.command}),
     };
 }
 
@@ -90,4 +101,7 @@ test {
     _ = @import("paths.zig");
     _ = @import("pgdb.zig");
     _ = @import("pgwire.zig");
+    _ = @import("layer.zig");
+    _ = @import("https.zig");
+    _ = @import("roots.zig");
 }

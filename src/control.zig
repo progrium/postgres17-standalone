@@ -11,6 +11,8 @@
 //!   logs [follow]   the log window; with follow, then new output until
 //!                   the server exits or the client hangs up
 //!   clients         the number of client connections
+//!   hold            keeps the server from idling out until the client
+//!                   closes the connection
 //!
 //! A server refuses a request in another protocol version, naming both.
 
@@ -131,6 +133,22 @@ pub fn stream(arena: std.mem.Allocator, io: std.Io, socket: []const u8, command:
     }
     out.flush() catch {};
     return null;
+}
+
+/// Holds the server open: it counts the connection as a client until it's
+/// closed, so the idle timeout waits for it (minipg run).
+pub fn hold(io: std.Io, socket: []const u8) !std.Io.net.Stream {
+    const conn = try dial(io, socket);
+    errdefer conn.close(io);
+    var wbuf: [64]u8 = undefined;
+    var w = conn.writer(io, &wbuf);
+    try w.interface.print("minipg/{d} hold\n", .{protocol});
+    try w.interface.flush();
+    var rbuf: [64]u8 = undefined;
+    var r = conn.reader(io, &rbuf);
+    const head = (r.interface.takeDelimiter('\n') catch return error.Protocol) orelse return error.Protocol;
+    if (!std.mem.eql(u8, head, "ok")) return error.Refused;
+    return conn;
 }
 
 /// Parses a request line: its protocol version and the rest.

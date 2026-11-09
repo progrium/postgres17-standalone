@@ -12,6 +12,8 @@ const roots = @import("roots.zig");
 const vm = @import("vm.zig");
 const net = @import("net.zig");
 const paths = @import("paths.zig");
+const pgwire = @import("pgwire.zig");
+const host = @import("host.zig");
 
 const Pgdb = pgdb_mod.Pgdb;
 
@@ -74,15 +76,20 @@ fn openOrCreate(ctx: Ctx, args: cli.Args, path: []const u8) ?Pgdb {
 pub fn init(ctx: Ctx, args: cli.Args) !u8 {
     const path = args.pgdb() orelse return usageError(ctx, "init needs a .pgdb path", .{});
     if (std.Io.Dir.cwd().access(ctx.io, path, .{})) |_| return ctx.fail("{s} already exists", .{path}) else |_| {}
-    if (args.flag(&.{"pg"})) |m| {
-        const meta = try roots.embeddedMeta(ctx.arena);
-        if (!std.mem.eql(u8, m, try std.fmt.allocPrint(ctx.arena, "{d}", .{meta.major})))
-            return ctx.fail("this minipg has only Postgres {d}", .{meta.major});
-    }
-    const c = newConfig(ctx, args, path) catch |err| switch (err) {
+    var c = newConfig(ctx, args, path) catch |err| switch (err) {
         error.BadPort => return usageError(ctx, "--port takes a port number", .{}),
         else => return err,
     };
+    // --pg MAJOR: the newest root for that major, downloaded if need be.
+    if (args.flag(&.{"pg"})) |m| {
+        const major = std.fmt.parseInt(u32, m, 10) catch return usageError(ctx, "--pg takes a Postgres major, such as 17", .{});
+        const r = roots.forMajor(ctx, major, .{}) catch |err| switch (err) {
+            error.NoRoot => return 1,
+            else => return err,
+        };
+        c.pg_major = major;
+        c.pg_digest = r.meta.digest;
+    }
     const p = try pgdb_mod.create(ctx.arena, ctx.io, path, c);
     const code = server.initialize(ctx, p) catch |err| blk: {
         ctx.warn("{t}", .{err});
@@ -94,10 +101,10 @@ pub fn init(ctx: Ctx, args: cli.Args) !u8 {
         std.Io.Dir.cwd().deleteTree(ctx.io, p.path) catch {};
         return 1;
     }
-    const meta = try roots.embeddedMeta(ctx.arena);
+    const opened = (pgdb_mod.open(ctx.arena, ctx.io, p.path) catch p).config.pg_last_opened;
     var buf: [256]u8 = undefined;
     var out = ctx.stdout(&buf);
-    try out.interface.print("created {s} (Postgres {s}, database {s})\n", .{ path, meta.version, c.database });
+    try out.interface.print("created {s} (Postgres {s}, database {s})\n", .{ path, opened, c.database });
     try out.interface.flush();
     return 0;
 }
@@ -249,6 +256,12 @@ fn hostCwd(ctx: Ctx) ![]const u8 {
 
 /// Runs `argv` in a tool machine connected to the .pgdb's server.
 fn runToolOn(ctx: Ctx, args: cli.Args, p: Pgdb, argv: []const []const u8) !u8 {
+    return runToolOnWith(ctx, args, p, argv, null, null);
+}
+
+/// The same, with the tool's stdin read from `in` instead of the caller's,
+/// and its cwd `cwd` instead of the caller's.
+fn runToolOnWith(ctx: Ctx, args: cli.Args, p: Pgdb, argv: []const []const u8, in: ?*host.Stdin, cwd: ?[]const u8) !u8 {
     const root = roots.forPgdb(ctx, p) catch |err| switch (err) {
         error.NoRoot => return 1,
         else => return err,
@@ -259,7 +272,7 @@ fn runToolOn(ctx: Ctx, args: cli.Args, p: Pgdb, argv: []const []const u8) !u8 {
     };
     const conn = connFor(args, p, r);
     const env = try vm.environment(ctx.arena, root.meta, try conn.pgEnv(ctx.arena));
-    return vm.runTool(ctx.gpa, ctx.io, ctx.env, .{ .root = root, .cwd = try hostCwd(ctx), .env = env, .argv = argv });
+    return vm.runTool(ctx.gpa, ctx.io, ctx.env, .{ .root = root, .cwd = cwd orelse try hostCwd(ctx), .env = env, .argv = argv, .in = in });
 }
 
 /// MINIPG_IDLE, in seconds.
@@ -292,4 +305,321 @@ pub fn exec(ctx: Ctx, args: cli.Args) !u8 {
     if (args.rest.len == 0) return usageError(ctx, "exec needs a tool: minipg exec {s} -- TOOL [args]", .{path});
     const p = openPgdb(ctx, path) orelse return 1;
     return runToolOn(ctx, args, p, args.rest);
+}
+
+/// A host-side admin connection to the .pgdb's server, as its superuser.
+fn admin(ctx: Ctx, p: Pgdb, r: client.Running, database: []const u8) !*pgwire.Conn {
+    return pgwire.Conn.connect(ctx.gpa, ctx.io, .{
+        .host = net.dialHost(r.info.listen),
+        .port = r.info.port,
+        .user = p.config.user,
+        .password = p.config.password,
+        .database = database,
+    }) catch |err| {
+        ctx.warn("connecting to {s}: {s}", .{ p.path, if (pgwire.lastConnectError().len > 0) pgwire.lastConnectError() else @errorName(err) });
+        return error.Reported;
+    };
+}
+
+/// The server for a command that needs one: started if need be.
+fn ensureServer(ctx: Ctx, p: Pgdb) !client.Running {
+    _ = roots.forPgdb(ctx, p) catch |err| switch (err) {
+        error.NoRoot => return error.Reported,
+        else => return err,
+    };
+    return client.ensure(ctx, p, .{ .idle_timeout = idleTimeout(ctx) }) catch |err| switch (err) {
+        error.ServerFailed => error.Reported,
+        else => {
+            ctx.warn("starting the server for {s}: {t}", .{ p.path, err });
+            return error.Reported;
+        },
+    };
+}
+
+/// Quotes an SQL identifier.
+fn ident(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '"');
+    for (name) |ch| {
+        if (ch == '"') try out.append(arena, '"');
+        try out.append(arena, ch);
+    }
+    try out.append(arena, '"');
+    return out.items;
+}
+
+/// Quotes an SQL string literal.
+fn literal(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '\'');
+    for (s) |ch| {
+        if (ch == '\'') try out.append(arena, '\'');
+        try out.append(arena, ch);
+    }
+    try out.append(arena, '\'');
+    return out.items;
+}
+
+/// Shell-quotes a value for `env`'s exports.
+fn shellQuote(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(arena, '\'');
+    for (s) |ch| {
+        if (ch == '\'') try out.appendSlice(arena, "'\\''") else try out.append(arena, ch);
+    }
+    try out.append(arena, '\'');
+    return out.items;
+}
+
+pub fn envCmd(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "env needs a .pgdb path", .{});
+    const p = openOrCreate(ctx, args, path) orelse return 1;
+    const conn = connFor(args, p, try client.find(ctx, p));
+    var buf: [1024]u8 = undefined;
+    var out = ctx.stdout(&buf);
+    const w = &out.interface;
+    try w.print("export DATABASE_URL={s}\n", .{try shellQuote(ctx.arena, try conn.url(ctx.arena))});
+    for (try conn.pgEnv(ctx.arena)) |v| try w.print("export {s}={s}\n", .{ v.name, try shellQuote(ctx.arena, v.value) });
+    try w.flush();
+    return 0;
+}
+
+pub fn run(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "run needs a .pgdb path", .{});
+    const argv = if (args.rest.len > 0) args.rest else if (args.positional.len > 1) args.positional[1..] else return usageError(ctx, "run needs a command: minipg run {s} -- CMD [args]", .{path});
+    const p = openOrCreate(ctx, args, path) orelse return 1;
+    const r = ensureServer(ctx, p) catch |err| switch (err) {
+        error.Reported => return 1,
+        else => return err,
+    };
+    // Hold the server open while the command runs, whether or not it has
+    // connected yet.
+    const hold = control.hold(ctx.io, r.info.control) catch null;
+    defer if (hold) |h| h.close(ctx.io);
+
+    const conn = connFor(args, p, r);
+    var env_map = try ctx.env.clone(ctx.arena);
+    try env_map.put("DATABASE_URL", try conn.url(ctx.arena));
+    for (try conn.pgEnv(ctx.arena)) |v| try env_map.put(v.name, v.value);
+    var child = std.process.spawn(ctx.io, .{ .argv = argv, .environ_map = &env_map }) catch |err|
+        return ctx.fail("{s}: {t}", .{ argv[0], err });
+    const term = try child.wait(ctx.io);
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |sig| 128 +| @as(u8, @truncate(@intFromEnum(sig))),
+        else => 1,
+    };
+}
+
+pub fn dump(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "dump needs a .pgdb path", .{});
+    const p = openPgdb(ctx, path) orelse return 1;
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(ctx.arena, "pg_dump");
+    try argv.appendSlice(ctx.arena, args.positional[1..]);
+    try argv.appendSlice(ctx.arena, args.rest);
+    return runToolOn(ctx, args, p, argv.items);
+}
+
+pub fn restore(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "restore needs a .pgdb path", .{});
+    const p = openOrCreate(ctx, args, path) orelse return 1;
+    const db = args.flag(&.{ "d", "db" }) orelse p.config.database;
+    var file: ?[]const u8 = if (args.positional.len > 1) try pgdb_mod.absolute(ctx.arena, ctx.io, args.positional[1]) else null;
+    var fd: std.posix.fd_t = std.posix.STDIN_FILENO;
+    if (file) |f| {
+        const h = std.Io.Dir.cwd().openFile(ctx.io, f, .{}) catch |err| return ctx.fail("{s}: {t}", .{ f, err });
+        fd = h.handle;
+    }
+    var in_buf: [64 << 10]u8 = undefined;
+    var in: host.Stdin = undefined;
+    in.initFd(fd, &in_buf);
+    // pg_dump's custom format starts with PGDMP; anything else is SQL.
+    const head = in.interface.peek(5) catch "";
+    if (!std.mem.eql(u8, head, "PGDMP")) {
+        // SQL through psql's stdin; query results are dropped, errors stop it.
+        return runToolOnWith(ctx, args, p, &.{ "psql", "-X", "-q", "-o", "/dev/null", "-v", "ON_ERROR_STOP=1", "-d", db }, &in, null);
+    }
+    // pg_restore reads an archive from a file: in h9 it misreads one from
+    // stdin. A dump on stdin goes to a temporary file first.
+    var tmp_dir: ?[]const u8 = null;
+    defer if (tmp_dir) |t| std.Io.Dir.cwd().deleteTree(ctx.io, t) catch {};
+    if (file == null) {
+        var rnd: [8]u8 = undefined;
+        ctx.io.random(&rnd);
+        const t = try std.fmt.allocPrint(ctx.arena, "{s}/minipg-restore-{x}", .{ ctx.getenv("TMPDIR") orelse "/tmp", &rnd });
+        try paths.makePrivateDir(ctx.io, ctx.arena, t);
+        tmp_dir = t;
+        const f = try std.fmt.allocPrint(ctx.arena, "{s}/dump", .{t});
+        var out = try std.Io.Dir.cwd().createFile(ctx.io, f, .{});
+        defer out.close(ctx.io);
+        var wbuf: [64 << 10]u8 = undefined;
+        var w = out.writer(ctx.io, &wbuf);
+        _ = try in.interface.streamRemaining(&w.interface);
+        try w.interface.flush();
+        file = f;
+    }
+    // The tool's cwd is the dump's directory, so the dump can be anywhere.
+    const dir = std.fs.path.dirname(file.?) orelse ".";
+    const argv: []const []const u8 = &.{ "pg_restore", "--no-owner", "--no-acl", "--exit-on-error", "-d", db, std.fs.path.basename(file.?) };
+    return runToolOnWith(ctx, args, p, argv, null, dir);
+}
+
+pub fn dbs(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "dbs needs a .pgdb path", .{});
+    const p = openPgdb(ctx, path) orelse return 1;
+    const r = ensureServer(ctx, p) catch |err| switch (err) {
+        error.Reported => return 1,
+        else => return err,
+    };
+    const c = admin(ctx, p, r, "postgres") catch return 1;
+    defer c.close();
+    const rows = c.query(ctx.arena, "select datname, pg_size_pretty(pg_database_size(oid)) from pg_database where not datistemplate order by 1") catch
+        return ctx.fail("{s}", .{c.err_msg});
+    var buf: [1024]u8 = undefined;
+    var out = ctx.stdout(&buf);
+    for (rows) |row| {
+        const name = row[0] orelse "";
+        try out.interface.print("{s} {s:<24} {s}\n", .{ if (std.mem.eql(u8, name, p.config.database)) "*" else " ", name, row[1] orelse "" });
+    }
+    try out.interface.flush();
+    return 0;
+}
+
+fn nameArg(ctx: Ctx, args: cli.Args, what: []const u8) ?[]const u8 {
+    if (args.positional.len < 2) {
+        _ = usageError(ctx, "{s} needs a database name: minipg {s} <pgdb> NAME", .{ what, what });
+        return null;
+    }
+    return args.positional[1];
+}
+
+pub fn create(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "create needs a .pgdb path", .{});
+    const name = nameArg(ctx, args, "create") orelse return 2;
+    const p = openPgdb(ctx, path) orelse return 1;
+    const r = ensureServer(ctx, p) catch |err| switch (err) {
+        error.Reported => return 1,
+        else => return err,
+    };
+    const c = admin(ctx, p, r, "postgres") catch return 1;
+    defer c.close();
+    _ = c.query(ctx.arena, try std.fmt.allocPrint(ctx.arena, "create database {s}", .{try ident(ctx.arena, name)})) catch
+        return ctx.fail("{s}", .{c.err_msg});
+    return 0;
+}
+
+pub fn drop(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "drop needs a .pgdb path", .{});
+    const name = nameArg(ctx, args, "drop") orelse return 2;
+    const p = openPgdb(ctx, path) orelse return 1;
+    if (std.mem.eql(u8, name, p.config.database))
+        return ctx.fail("{s} is the default database; make another the default first (minipg default {s} NAME)", .{ name, path });
+    const r = ensureServer(ctx, p) catch |err| switch (err) {
+        error.Reported => return 1,
+        else => return err,
+    };
+    const c = admin(ctx, p, r, "postgres") catch return 1;
+    defer c.close();
+    _ = c.query(ctx.arena, try std.fmt.allocPrint(ctx.arena, "drop database {s}", .{try ident(ctx.arena, name)})) catch
+        return ctx.fail("{s}", .{c.err_msg});
+    return 0;
+}
+
+pub fn default(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "default needs a .pgdb path", .{});
+    var p = openPgdb(ctx, path) orelse return 1;
+    if (args.positional.len < 2) {
+        var buf: [256]u8 = undefined;
+        var out = ctx.stdout(&buf);
+        try out.interface.print("{s}\n", .{p.config.database});
+        try out.interface.flush();
+        return 0;
+    }
+    const name = args.positional[1];
+    const r = ensureServer(ctx, p) catch |err| switch (err) {
+        error.Reported => return 1,
+        else => return err,
+    };
+    const c = admin(ctx, p, r, "postgres") catch return 1;
+    defer c.close();
+    const n = (c.scalar(ctx.arena, try std.fmt.allocPrint(ctx.arena, "select count(*) from pg_database where datname = {s}", .{try literal(ctx.arena, name)})) catch
+        return ctx.fail("{s}", .{c.err_msg})) orelse "0";
+    if (std.mem.eql(u8, n, "0")) return ctx.fail("{s} has no database {s} (minipg create {s} {s})", .{ path, name, path, name });
+    p.config.database = name;
+    try p.save(ctx.arena, ctx.io);
+    return 0;
+}
+
+pub fn passwd(ctx: Ctx, args: cli.Args) !u8 {
+    const path = args.pgdb() orelse return usageError(ctx, "passwd needs a .pgdb path", .{});
+    var p = openPgdb(ctx, path) orelse return 1;
+    const r = ensureServer(ctx, p) catch |err| switch (err) {
+        error.Reported => return 1,
+        else => return err,
+    };
+    const c = admin(ctx, p, r, "postgres") catch return 1;
+    defer c.close();
+    const pw = ctx.getenv("POSTGRES_PASSWORD") orelse try pgdb_mod.generatePassword(ctx.arena, ctx.io);
+    // Postgres hashes it with SCRAM before storing it (password_encryption).
+    _ = c.query(ctx.arena, try std.fmt.allocPrint(ctx.arena, "alter role {s} password {s}", .{ try ident(ctx.arena, p.config.user), try literal(ctx.arena, pw) })) catch
+        return ctx.fail("{s}", .{c.err_msg});
+    p.config.password = pw;
+    p.save(ctx.arena, ctx.io) catch |err| {
+        // The role has the new password now; say it, so it isn't lost.
+        ctx.warn("the password changed, but saving minipg.toml failed ({t}); the new password is {s}", .{ err, pw });
+        return 1;
+    };
+    // The server's monitor logs in with the old one; it reconnects with
+    // the new one after a restart. Existing sessions keep working.
+    ctx.warn("password rotated; apps need the new URL (minipg url {s})", .{path});
+    return 0;
+}
+
+pub fn versions(ctx: Ctx, args: cli.Args) !u8 {
+    _ = args;
+    const meta = try roots.embeddedMeta(ctx.arena);
+    var buf: [1024]u8 = undefined;
+    var out = ctx.stdout(&buf);
+    const w = &out.interface;
+    try w.print("embedded  {s:<8} {s}\n", .{ meta.version, meta.digest });
+    for (try roots.list(ctx)) |r| {
+        if (std.mem.eql(u8, r.meta.digest, meta.digest)) continue;
+        try w.print("cached    {s:<8} {s}\n", .{ r.meta.version, r.meta.digest });
+    }
+    try w.print("Other majors download on demand, or with minipg fetch MAJOR ({s}).\n", .{if (ctx.getenv("MINIPG_OFFLINE") != null) "off: MINIPG_OFFLINE is set" else @import("registry.zig").Source.fromEnv(ctx).host});
+    try w.flush();
+    return 0;
+}
+
+pub fn fetch(ctx: Ctx, args: cli.Args) !u8 {
+    const m = args.pgdb() orelse return usageError(ctx, "fetch needs a Postgres major, such as 17", .{});
+    const major = std.fmt.parseInt(u32, m, 10) catch return usageError(ctx, "fetch needs a Postgres major, such as 17", .{});
+    if (ctx.getenv("MINIPG_OFFLINE") != null) return ctx.fail("MINIPG_OFFLINE is set", .{});
+    const r = @import("registry.zig").pull(ctx, major) catch |err| return ctx.fail("downloading Postgres {d}: {s}", .{ major, @import("registry.zig").describe(err) });
+    var buf: [256]u8 = undefined;
+    var out = ctx.stdout(&buf);
+    try out.interface.print("Postgres {s} ({s})\n", .{ r.meta.version, r.meta.digest });
+    try out.interface.flush();
+    return 0;
+}
+
+pub fn prune(ctx: Ctx, args: cli.Args) !u8 {
+    _ = args;
+    const meta = try roots.embeddedMeta(ctx.arena);
+    const keep = try roots.dirName(ctx.arena, meta.digest);
+    var d = std.Io.Dir.cwd().openDir(ctx.io, ctx.dirs.roots, .{ .iterate = true }) catch return 0;
+    defer d.close(ctx.io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = d.iterate();
+    while (try it.next(ctx.io)) |e| {
+        const base = if (std.mem.endsWith(u8, e.name, ".json")) e.name[0 .. e.name.len - 5] else e.name;
+        if (std.mem.eql(u8, base, keep)) continue;
+        try names.append(ctx.arena, try ctx.arena.dupe(u8, e.name));
+    }
+    for (names.items) |n| {
+        d.deleteTree(ctx.io, n) catch |err| ctx.warn("removing {s}: {t}", .{ n, err });
+        if (!std.mem.endsWith(u8, n, ".json")) ctx.warn("removed {s}", .{n});
+    }
+    return 0;
 }

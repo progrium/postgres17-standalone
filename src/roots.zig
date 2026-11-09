@@ -119,11 +119,89 @@ pub fn writeMeta(arena: std.mem.Allocator, io: std.Io, cache: std.Io.Dir, name: 
     try cache.writeFile(io, .{ .sub_path = file, .data = json });
 }
 
-/// The root a .pgdb runs on: one whose major matches the .pgdb's. Prints
-/// why there is none and returns `error.NoRoot`.
-pub fn forPgdb(ctx: anytype, p: anytype) !Root {
-    const r = try embedded(ctx.gpa, ctx.arena, ctx.io, ctx.dirs.roots);
-    if (p.config.pg_major == 0 or p.config.pg_major == r.meta.major) return r;
-    ctx.warn("{s} uses Postgres {d}, and this minipg has only Postgres {d}", .{ p.path, p.config.pg_major, r.meta.major });
+/// The root cached under `name` (a directory and its `<name>.json`), if
+/// it's there.
+pub fn cached(ctx: anytype, name: []const u8) ?Root {
+    const arena = ctx.arena;
+    const dir = std.fs.path.join(arena, &.{ ctx.dirs.roots, name }) catch return null;
+    const json_path = std.fmt.allocPrint(arena, "{s}.json", .{dir}) catch return null;
+    std.Io.Dir.cwd().access(ctx.io, dir, .{}) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(ctx.io, json_path, arena, .limited(1 << 20)) catch return null;
+    const meta = parseMeta(arena, text) catch return null;
+    return .{ .dir = std.Io.Dir.cwd().realPathFileAlloc(ctx.io, dir, arena) catch return null, .meta = meta };
+}
+
+/// Every root in the cache for this host's arch.
+pub fn list(ctx: anytype) ![]Root {
+    const arena = ctx.arena;
+    var out: std.ArrayList(Root) = .empty;
+    var d = std.Io.Dir.cwd().openDir(ctx.io, ctx.dirs.roots, .{ .iterate = true }) catch return out.items;
+    defer d.close(ctx.io);
+    var it = d.iterate();
+    while (try it.next(ctx.io)) |e| {
+        if (!std.mem.endsWith(u8, e.name, ".json")) continue;
+        const name = try arena.dupe(u8, e.name[0 .. e.name.len - 5]);
+        const r = cached(ctx, name) orelse continue;
+        if (std.mem.eql(u8, r.meta.arch, host_arch)) try out.append(arena, r);
+    }
+    std.mem.sort(Root, out.items, {}, struct {
+        fn lt(_: void, a: Root, b: Root) bool {
+            return versionLess(b.meta.version, a.meta.version);
+        }
+    }.lt);
+    return out.items;
+}
+
+/// Compares Postgres versions such as 17.4 and 18.10 numerically.
+pub fn versionLess(a: []const u8, b: []const u8) bool {
+    var ia = std.mem.splitScalar(u8, a, '.');
+    var ib = std.mem.splitScalar(u8, b, '.');
+    while (true) {
+        const pa = ia.next();
+        const pb = ib.next();
+        if (pa == null or pb == null) return pa == null and pb != null;
+        const na = std.fmt.parseInt(u32, pa.?, 10) catch 0;
+        const nb = std.fmt.parseInt(u32, pb.?, 10) catch 0;
+        if (na != nb) return na < nb;
+    }
+}
+
+pub const Want = struct {
+    /// Download the major if no root has it (unless MINIPG_OFFLINE).
+    fetch: bool = true,
+};
+
+/// The newest root for a Postgres major: the embedded one, a cached one,
+/// or (unless MINIPG_OFFLINE is set) one downloaded now. Prints why there
+/// is none and returns `error.NoRoot`.
+pub fn forMajor(ctx: anytype, major: u32, want: Want) !Root {
+    const meta = try embeddedMeta(ctx.arena);
+    var best: ?Root = null;
+    for (try list(ctx)) |r| {
+        if (r.meta.major == major and (best == null or versionLess(best.?.meta.version, r.meta.version))) best = r;
+    }
+    if (meta.major == major and (best == null or !versionLess(meta.version, best.?.meta.version)))
+        return embedded(ctx.gpa, ctx.arena, ctx.io, ctx.dirs.roots);
+    if (best) |b| return b;
+    if (want.fetch and ctx.getenv("MINIPG_OFFLINE") == null) {
+        return @import("registry.zig").pull(ctx, major) catch |err| {
+            ctx.warn("downloading Postgres {d}: {s}", .{ major, @import("registry.zig").describe(err) });
+            return error.NoRoot;
+        };
+    }
+    ctx.warn("no Postgres {d} root is available{s}; minipg fetch {d} downloads it", .{ major, if (ctx.getenv("MINIPG_OFFLINE") != null) " offline (MINIPG_OFFLINE is set)" else "", major });
     return error.NoRoot;
+}
+
+/// The root a .pgdb runs on: the newest one for its major.
+pub fn forPgdb(ctx: anytype, p: anytype) !Root {
+    const major = if (p.config.pg_major != 0) p.config.pg_major else (try embeddedMeta(ctx.arena)).major;
+    return forMajor(ctx, major, .{});
+}
+
+test versionLess {
+    try std.testing.expect(versionLess("17.4", "18.1"));
+    try std.testing.expect(versionLess("18.2", "18.10"));
+    try std.testing.expect(!versionLess("18.10", "18.2"));
+    try std.testing.expect(!versionLess("18.1", "18.1"));
 }

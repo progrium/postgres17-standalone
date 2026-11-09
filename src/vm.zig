@@ -107,6 +107,8 @@ pub const ToolRun = struct {
     cwd: []const u8,
     env: []const h9.EnvVar,
     argv: []const []const u8,
+    /// Stdin instead of the caller's (restore's dump file); never a terminal.
+    in: ?*host.Stdin = null,
 };
 
 /// Runs a tool such as psql in a fresh machine with the caller's stdio,
@@ -114,7 +116,7 @@ pub const ToolRun = struct {
 pub fn runTool(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map, r: ToolRun) !u8 {
     var terminal: host.Terminal = .{};
     defer terminal.restore();
-    const tty = (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
+    const tty = r.in == null and (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
 
     var sig: host.Signals = undefined;
     try sig.init(io, .tool, null);
@@ -145,8 +147,8 @@ pub fn runTool(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.E
         },
         .signals = &sig.machine,
         .stdio = .{
-            .in = &stdin.interface,
-            .in_cancel = stdin.cancelHook(),
+            .in = if (r.in) |i| &i.interface else &stdin.interface,
+            .in_cancel = if (r.in) |i| i.cancelHook() else stdin.cancelHook(),
             .out = &out.interface,
             .err = &err_w.interface,
             .raw = if (tty) terminal.hook() else null,
