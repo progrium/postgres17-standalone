@@ -41,6 +41,15 @@ e2e: build
 	cd .dev/e2e && MINIPG=$(CURDIR)/$(OUT) go test -count=1 -v ./...
 .PHONY: e2e
 
+# A -run pattern for the stress suite.
+STRESS_RUN		?= Stress
+
+## Run the stress suite against ./minipg: crash and durability, soak, resource limits, and recovery (slow; not in CI)
+## Knobs: STRESS_ROUNDS (crash rounds per kill mode), STRESS_SOAK (pgbench duration), STRESS_SCALE, STRESS_SEED, STRESS_RUN (a -run pattern)
+stress: build
+	cd .dev/e2e && MINIPG=$(CURDIR)/$(OUT) go test -tags stress -count=1 -v -timeout 4h -run '$(STRESS_RUN)' ./...
+.PHONY: stress
+
 ## Clean build outputs
 clean:
 	rm -rf $(DIST_DIR) .zig-out zig-out .zig-cache $(NAME)
