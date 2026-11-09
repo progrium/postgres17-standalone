@@ -132,11 +132,9 @@ make e2e      # builds ./minipg, then drives it end to end (.dev/e2e, Go)
 
 ## Known limits
 
-- **Directory fsync.** h9 silently skips fsync on directories ([hyper9#112](https://github.com/progrium/hyper9/issues/112)), so a crash or power loss right after Postgres renames or creates a file can lose that change. File fsyncs (WAL, data files) do reach the disk.
 - **Speed.** On h9's native backend (x86_64 Linux without KVM), Postgres is about 2x slower than native for one client and 6 to 12x under load, and a new connection costs about 27 ms. Apps that don't pool connections will feel it. KVM and HVF haven't been measured.
 - **Killed servers.** On the native backend each Postgres process is its own host process. If the server process is killed outright (SIGKILL, OOM), they live on for a few seconds before exiting, and the `.pgdb` stays locked until they do; minipg waits for that. Postgres recovers from its WAL on the next start.
 - **pg_restore from a pipe.** pg_restore misreads a custom-format archive on stdin inside h9, so `minipg restore` spools stdin to a temp file first.
-- **Log noise.** h9 logs "process exceeds N file descriptors" while Postgres probes its fd limit; it's harmless.
 - **Cross-arch.** A `.pgdb` records the arch it was created on, and the server warns when it's opened on another.
 
 ## License
