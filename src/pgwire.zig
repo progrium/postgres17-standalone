@@ -1,5 +1,5 @@
 //! A minimal Postgres client: the v3 wire protocol's startup, SCRAM-SHA-256
-//! (or trust) authentication and simple queries over TCP. minipg uses it on
+//! (or trust) authentication and simple queries over TCP or a unix socket. minipg uses it on
 //! the host for what doesn't need a tool machine: checking that a server is
 //! ready, counting clients, and small admin queries.
 
@@ -21,6 +21,8 @@ pub const Error = error{
 };
 
 pub const Options = struct {
+    /// An address, or as in libpq, a directory holding the server's unix
+    /// socket (`.s.PGSQL.<port>`) when it starts with `/`.
     host: []const u8 = "127.0.0.1",
     port: u16,
     user: []const u8,
@@ -49,8 +51,15 @@ pub const Conn = struct {
     /// Connects and authenticates. The returned value must not move, since
     /// its reader and writer point into it, so it's heap-allocated.
     pub fn connect(gpa: std.mem.Allocator, io: Io, opts: Options) Error!*Conn {
-        const addr = Io.net.IpAddress.parse(opts.host, opts.port) catch return error.ConnectFailed;
-        const stream = addr.connect(io, .{ .mode = .stream }) catch return error.ConnectFailed;
+        const stream = if (opts.host.len > 0 and opts.host[0] == '/') blk: {
+            var buf: [std.Io.net.UnixAddress.max_len]u8 = undefined;
+            const path = std.fmt.bufPrint(&buf, "{s}/.s.PGSQL.{d}", .{ opts.host, opts.port }) catch return error.ConnectFailed;
+            const ua = Io.net.UnixAddress.init(path) catch return error.ConnectFailed;
+            break :blk ua.connect(io) catch return error.ConnectFailed;
+        } else blk: {
+            const addr = Io.net.IpAddress.parse(opts.host, opts.port) catch return error.ConnectFailed;
+            break :blk addr.connect(io, .{ .mode = .stream }) catch return error.ConnectFailed;
+        };
         const c = gpa.create(Conn) catch {
             stream.close(io);
             return error.OutOfMemory;
