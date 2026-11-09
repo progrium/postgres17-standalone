@@ -130,6 +130,7 @@ make dist VERSION=v0.4           # dist/minipg_v0.4_<os>_<arch>.zip
 ```sh
 make test     # unit tests
 make e2e      # builds ./minipg, then drives it end to end (.dev/e2e, Go)
+make stress   # the slow stress suite: kill -9 mid-write, soak, limits, recovery
 ```
 
 ## Known limits
