@@ -1,0 +1,19 @@
+.{
+    .name = .minipg,
+    .version = "0.4.0",
+    .fingerprint = 0xf19c55893363b708,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // hyper9 as a git submodule: its build.zig.zon leaves drawterm's
+        // vendored sources out of the package, so it can't be fetched by
+        // URL yet (hyper9 docs/embedding.md).
+        .h9 = .{ .path = "deps/hyper9" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "assets",
+        "h9.entitlements",
+    },
+}

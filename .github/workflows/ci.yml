@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: .dev/e2e/go.sum
+      # The root is pulled from Docker Hub; cache it so reruns don't count
+      # against the anonymous pull limit.
+      - uses: actions/cache@v4
+        with:
+          path: assets
+          key: root-amd64-${{ hashFiles('scripts/root.sh', 'Makefile') }}
+      - name: Unit tests
+        run: make test
+      - name: End-to-end tests
+        run: make e2e
+      - name: Cross-compile linux/arm64
+        run: make build OS=linux ARCH=arm64 OUT=minipg-arm64
