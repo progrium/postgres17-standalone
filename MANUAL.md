@@ -46,14 +46,12 @@ Download the zip for your platform from the releases page, unzip it, and put `mi
 
 | Platform | h9 backend | Needs | Tested |
 |---|---|---|---|
-| Linux x86_64 | KVM, or h9's native backend with `MINIPG_BACKEND=native` | Read and write access to `/dev/kvm`; for native, Linux 5.11 or later | Yes, on the native backend |
+| Linux x86_64 | KVM, or h9's native backend without it | Linux 5.11 or later | Yes, on the native backend |
 | Linux arm64 | KVM | Read and write access to `/dev/kvm` | Builds; not run |
 | macOS (Apple Silicon) | Hypervisor.framework | The hypervisor entitlement (release builds are signed ad hoc with it) | Builds; not run |
 | Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature turned on | Yes, on WHP |
 
 Linux builds are static musl binaries, so the same binary runs on glibc distros, Alpine, and minimal container images. Intel Macs and Windows on ARM aren't supported yet. (h9 has no WHP backend for arm64 yet, and minipg leaves out h9's emulator, which is GPL-licensed.)
-
-**The native backend** runs Postgres's processes as host processes and intercepts their system calls. It's not a sandbox: anyone who can run code in the guest, which a Postgres superuser can with `COPY ... TO PROGRAM`, can reach your account. So h9 never picks it by itself, and minipg uses it only when `MINIPG_BACKEND=native` asks for it, typically in CI, where there's no KVM and the database is throwaway.
 
 **On Windows,** turn on the Windows Hypervisor Platform in Settings > System > Optional features > More Windows features, or run `DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform` as an administrator, then restart. Without it, minipg says the hypervisor is unavailable. Run minipg from PowerShell, Windows Terminal, or `cmd`; the examples in this manual use POSIX shell syntax, and translate directly.
 
@@ -92,7 +90,7 @@ Connect an app:
 
 ```sh
 minipg url app.pgdb                  # postgres://postgres:...@127.0.0.1:54321/app
-minipg run app.pgdb -- npm start     # npm start, with DATABASE_URL and PG* set
+minipg run app.pgdb -- env           # run npm start, etc with DATABASE_URL and PG* set
 ```
 
 Back it up and restore it:
@@ -406,12 +404,11 @@ minipg trims what a server doesn't need from the image: LLVM, headers, and docum
 
 ## 9. Containers and CI
 
-minipg needs no installation, no privileges, and no devices in a container. The Linux binary is static, and without `/dev/kvm`, `MINIPG_BACKEND=native` runs Postgres on h9's native backend, which needs only Linux 5.11 or later. There's no `--privileged`, no `--device`, and no extra capabilities to grant. minipg's own end-to-end tests run this way on stock GitHub runners. The native backend isn't a sandbox (see [Installing](#2-installing)), which suits a throwaway test database.
+minipg needs no installation, no privileges, and no devices in a container. The Linux binary is static, and without `/dev/kvm`, h9 runs Postgres on its native backend, which needs only Linux 5.11 or later. There's no `--privileged`, no `--device`, and no extra capabilities to grant. minipg's own end-to-end tests run this way on stock GitHub runners.
 
 A test job can be as small as this:
 
 ```sh
-export MINIPG_BACKEND=native     # no KVM on the runner
 minipg init test.pgdb
 minipg run test.pgdb -- go test ./...
 ```
@@ -426,9 +423,7 @@ The first command unpacks the root into `~/.cache/minipg` (on Linux). Cache that
     path: ~/.cache/minipg
     key: minipg-${{ runner.os }}
 - run: minipg init test.pgdb
-  env: { MINIPG_BACKEND: native }
 - run: minipg run test.pgdb -- npm test
-  env: { MINIPG_BACKEND: native }
 ```
 
 In a Dockerfile, copy the binary in and either `serve` as the entrypoint or use `run` around your app. (minipg's own tests run directly on GitHub's runners; running inside Docker hasn't been tested yet.)
@@ -436,7 +431,6 @@ In a Dockerfile, copy the binary in and either `serve` as the entrypoint or use 
 ```dockerfile
 FROM alpine:3.20
 COPY minipg /usr/local/bin/minipg
-ENV MINIPG_BACKEND=native
 CMD ["minipg", "run", "/data/app.pgdb", "--", "/app/server"]
 ```
 
@@ -469,6 +463,8 @@ KVM (on Linux) and Hypervisor.framework (on macOS) avoid the native backend's ma
 
 **What's tested.** minipg's end-to-end suite kills the server with `kill -9` in the middle of writes, restarts it, and checks that Postgres recovers from its WAL and that `amcheck` finds no index corruption. File `fsync` calls, directory `fsync` calls, and `sync` all reach the host's disk, so Postgres's own durability rules hold: a committed transaction survives a crash of minipg or of Postgres.
 
+**The stress suite.** `make stress` goes further, outside CI: it kills a server with `kill -9` many times over while writers commit, six ways (the whole process tree, the minipg server alone, one h9 stub, the postmaster, the backends, and the WAL writer and checkpointer), and checks after each that every acknowledged commit survived and nothing unacknowledged did. It also crashes bulk loads and pgbench runs, copies a crashed `.pgdb`, soaks under pgbench, exhausts connections, memory, and disk, and dumps and restores under load. Every cluster has data checksums, and every check ends with `amcheck` and `pg_checksums`. See [.dev/e2e/stress_test.go](.dev/e2e/stress_test.go) for its knobs.
+
 **What isn't.** Power loss and kernel crashes haven't been tested. Neither KVM, Hypervisor.framework, nor arm64 has been crash-tested yet.
 
 **Killed servers.** On the native backend, each Postgres process is its own host process. If the server process is killed outright (SIGKILL, or the OOM killer), those processes live on for a few seconds before exiting, and the `.pgdb` stays locked until they do. A command that wants a server waits for the lock and then starts one, and Postgres recovers from its WAL.
@@ -479,7 +475,7 @@ KVM (on Linux) and Hypervisor.framework (on macOS) avoid the native backend's ma
 
 ## 12. Troubleshooting
 
-**"cannot create a machine: no /dev/kvm ..." or "... no usable hypervisor".** There's no hypervisor minipg can use. On Linux, give your user read and write access to `/dev/kvm` (usually the `kvm` group), or in a VM, turn on nested virtualization. Where neither is possible, as on most CI runners, set `MINIPG_BACKEND=native` for a database you don't need sandboxed. On Windows, turn on the Windows Hypervisor Platform feature (see [Installing](#2-installing)).
+**"cannot create a machine: ... no usable hypervisor".** On Windows, turn on the Windows Hypervisor Platform feature (see [Installing](#2-installing)). On Linux without KVM, minipg uses h9's native backend, which needs Linux 5.11 or later.
 
 **"waiting for the server for app.pgdb to start..."** The first start unpacks the root and runs initdb, which can take several seconds, longer on a slow disk. Later starts take about 2 seconds. If it never finishes, minipg prints the end of the server's log.
 
@@ -603,7 +599,6 @@ Print minipg's version, or the usage summary.
 
 | Variable | Effect |
 |---|---|
-| `MINIPG_BACKEND` | The h9 backend: `auto` (the default: the host's hypervisor), `native` (x86_64 Linux without KVM; not a sandbox), `kvm`, `hvf`, or `whp`. |
 | `MINIPG_IDLE` | Seconds a background server waits without clients before stopping. Default 60. |
 | `MINIPG_OFFLINE` | When set, never download Postgres roots. |
 | `MINIPG_REGISTRY` | Registry to download roots from: `host`, or `host/repository`. Default Docker Hub. |
@@ -674,7 +669,7 @@ Everything here can be deleted while no server runs. Roots unpack again and logs
 
 A short tour, for the curious. The README's "How it works" section and the source have the details.
 
-- **h9.** hyper9 is a Plan 9 kernel that runs as a library inside minipg. Its Linux personality runs unmodified Linux binaries (here, Alpine's Postgres) on the host's hypervisor, answering their system calls itself. On x86_64 Linux without KVM, its native backend (`MINIPG_BACKEND=native`) runs each guest process as a host process and intercepts its system calls instead. On Windows, the hypervisor is the Windows Hypervisor Platform.
+- **h9.** hyper9 is a Plan 9 kernel that runs as a library inside minipg. Its Linux personality runs unmodified Linux binaries (here, Alpine's Postgres) on the host's hypervisor, answering their system calls itself. On x86_64 Linux without KVM, its native backend runs each guest process as a host process and intercepts its system calls instead. On Windows, the hypervisor is the Windows Hypervisor Platform.
 - **The server process** ([src/server.zig](src/server.zig)) holds the lock, picks the port, writes `run.json`, serves the control socket, and runs Postgres in an h9 machine. The machine's root is the unpacked Alpine image, and its writable working directory is the `.pgdb`. The image's own `docker-entrypoint.sh` initializes a new cluster. A monitor thread logs in to see when Postgres is ready, then counts clients in `pg_stat_activity` for `status` and the idle timeout.
 - **Shutdown** goes through a small supervisor shell in the machine, which sends SIGINT (a fast shutdown) to the postmaster alone.
 - **The control socket** ([src/control.zig](src/control.zig)) is a unix socket (AF_UNIX on Windows too) with a one-line, versioned request protocol: `status`, `stop`, `logs`, and `clients`.
@@ -692,6 +687,7 @@ make build OS=windows ARCH=amd64 # ./minipg.exe
 make build PG_MAJOR=17           # embed another major
 make test                        # unit tests
 make e2e                         # end-to-end tests against ./minipg
+make stress                      # the stress suite (slow; STRESS_ROUNDS, STRESS_SOAK)
 ```
 
 macOS builds have to be made on a Mac, for the SDK's Hypervisor framework. Windows builds cross-compile from Linux or macOS, and build on Windows too, with root.sh run from Git Bash or MSYS2. See the README's [Building](README.md#building) section for more.

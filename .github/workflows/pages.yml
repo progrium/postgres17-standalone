@@ -1,0 +1,72 @@
+# Publishes the project page (site/index.html) to GitHub Pages, with the
+# web demo (make web) in demo/: a shell with minipg, running Postgres 18
+# for 386 Linux on h9's browser host. The demo's browser test gates the
+# deploy.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, always the newest main.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The root is pulled from Docker Hub; cache it so reruns don't count
+      # against the anonymous pull limit.
+      - uses: actions/cache@v4
+        with:
+          path: assets
+          key: root-386-${{ hashFiles('scripts/root.sh', 'Makefile') }}
+      # h9's web host needs v86.wasm, which changes only with its pins.
+      - uses: actions/cache@v4
+        with:
+          path: deps/hyper9/.local/v86
+          key: v86-${{ hashFiles('deps/hyper9/scripts/pins.sh') }}
+      - run: cd deps/hyper9 && scripts/fetch.sh v86
+      - run: make web
+      - name: Demo in Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.63.0
+          npx playwright install --with-deps chromium
+          node web/test.mjs .zig-out/web
+      - name: Assemble the site
+        run: |
+          mkdir -p _site
+          cp site/index.html _site/
+          cp -R .zig-out/web _site/demo
+          cp LICENSE _site/demo/LICENSE
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

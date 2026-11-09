@@ -15,6 +15,31 @@ pub fn dialHost(listen: []const u8) []const u8 {
     return first;
 }
 
+/// The host for a client of a server described by `listen` and `socket`:
+/// its unix socket's directory when it has no TCP listener, else
+/// `dialHost(listen)`.
+pub fn clientHost(listen: []const u8, socket: []const u8) []const u8 {
+    if (socketOnly(listen) and socket.len > 0) return socket;
+    return dialHost(listen);
+}
+
+/// Whether a listen setting is `none`: Postgres on its unix socket alone,
+/// with no TCP listener (the Linux build only, where minipg and its
+/// clients share Postgres's file system).
+pub fn socketOnly(listen: []const u8) bool {
+    const t = std.mem.trim(u8, listen, " ");
+    return t.len == 0 or std.mem.eql(u8, t, "none");
+}
+
+/// Whether this host has TCP at all. h9's web host doesn't: a page has no
+/// sockets, so the Linux build defaults to `--listen none` there.
+pub fn tcpAvailable() bool {
+    const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    if (fd < 0) return false;
+    _ = c.close(fd);
+    return portFree("127.0.0.1", 0);
+}
+
 /// Whether a listen address is loopback only.
 pub fn isLoopback(listen: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, listen, ", ");
@@ -128,4 +153,7 @@ test dialHost {
     try std.testing.expect(isLoopback("localhost, ::1"));
     try std.testing.expect(!isLoopback("0.0.0.0"));
     try std.testing.expect(!isLoopback("*"));
+    try std.testing.expect(socketOnly("none"));
+    try std.testing.expect(socketOnly(""));
+    try std.testing.expect(!socketOnly("127.0.0.1"));
 }

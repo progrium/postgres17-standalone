@@ -88,23 +88,20 @@ psql, pg_dump, and the other tools run in their own short-lived h9 machine (abou
 
 | Platform | h9 backend | Needs | Tested |
 |---|---|---|---|
-| Linux x86_64 | KVM, or h9's native backend with `MINIPG_BACKEND=native` | read/write `/dev/kvm`; for native, Linux 5.11 or later | Yes, native backend |
+| Linux x86_64 | KVM, or h9's native backend without it | Linux 5.11 or later | Yes, native backend |
 | Linux arm64 | KVM | read/write `/dev/kvm` | Builds; not run |
 | macOS (Apple Silicon) | Hypervisor.framework | the hypervisor entitlement (the build signs ad hoc) | Not run |
 | Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature on | Yes, on WHP |
 
 Linux builds are static musl binaries, so one runs on glibc distros and Alpine alike. Windows on ARM isn't supported yet: h9 has no WHP backend for arm64, and minipg leaves out h9's emulator, which is GPL-licensed.
 
-The native backend runs Postgres's processes as host processes and intercepts their system calls, so it isn't a sandbox: anyone who can run code in the guest (a superuser can, with `COPY ... TO PROGRAM`) can reach your account. h9 never picks it by itself, and minipg uses it only when `MINIPG_BACKEND=native` asks for it. `MINIPG_BACKEND` also takes `auto` (the default), `kvm`, `hvf`, and `whp`.
-
 On Windows, turn the feature on in Settings > System > Optional features > More Windows features ("Windows Hypervisor Platform"), or with `DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform` as an administrator, then restart.
 
 ## In containers and CI
 
-Nothing needs installing or privileges: the Linux binary is static, and without `/dev/kvm`, `MINIPG_BACKEND=native` runs Postgres on h9's native backend, which needs Linux 5.11 or later and nothing else (no `--privileged`, no devices). minipg's own e2e suite runs that way in CI, on stock GitHub runners. The native backend isn't a sandbox (see [Platforms](#platforms)), which is fine for a throwaway test database. The first command unpacks the root into the cache directory, so mount or cache `~/.cache/minipg` to skip that on later runs. A test job can be as small as:
+Nothing needs installing or privileges: the Linux binary is static, and without `/dev/kvm` h9 runs Postgres on its native backend, which needs Linux 5.11 or later and nothing else (no `--privileged`, no devices). minipg's own e2e suite runs that way in CI, on stock GitHub runners. The first command unpacks the root into the cache directory, so mount or cache `~/.cache/minipg` to skip that on later runs. A test job can be as small as:
 
 ```sh
-export MINIPG_BACKEND=native     # no KVM on the runner
 minipg init test.pgdb
 minipg run test.pgdb -- go test ./...
 ```
@@ -137,6 +134,7 @@ make dist VERSION=v0.4           # dist/minipg_v0.4_<os>_<arch>.zip
 ```sh
 make test     # unit tests
 make e2e      # builds ./minipg, then drives it end to end (.dev/e2e, Go)
+make stress   # the slow stress suite: kill -9 mid-write, soak, limits, recovery
 ```
 
 ## Known limits
