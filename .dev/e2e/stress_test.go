@@ -654,11 +654,64 @@ func TestStressCrashCopy(t *testing.T) {
 // Load and soak
 
 // pgbench runs pgbench in a tool machine against the server.
+// A run that outlives its -T by three minutes has hung: it's killed, and
+// the error says what the server and the host's sockets were doing.
 func (e *env) pgbench(pgdb string, args ...string) (string, error) {
-	e.t.Helper()
+	limit := 3 * time.Minute
+	for i, a := range args {
+		if a == "-T" && i+1 < len(args) {
+			n, _ := strconv.Atoi(args[i+1])
+			limit += time.Duration(n) * time.Second
+		}
+	}
 	c := e.cmd("", nil, append([]string{"exec", pgdb, "--", "pgbench"}, args...)...)
-	out, err := c.CombinedOutput()
-	return string(out), err
+	var out strings.Builder
+	var mu sync.Mutex
+	w := writerFunc(func(b []byte) (int, error) { mu.Lock(); defer mu.Unlock(); return out.Write(b) })
+	c.Stdout, c.Stderr = w, w
+	if err := c.Start(); err != nil {
+		return "", err
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+	select {
+	case err := <-done:
+		mu.Lock()
+		defer mu.Unlock()
+		return out.String(), err
+	case <-time.After(limit):
+	}
+	diag := e.hangReport(pgdb)
+	c.Process.Kill()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	return out.String(), fmt.Errorf("pgbench %v hung (still running after %v)\n%s", args, limit, diag)
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
+
+// hangReport describes a server's client backends and the host's TCP
+// sockets on its port, with their unread bytes: data sitting in a socket
+// that a waiting process never reads is a lost wakeup.
+func (e *env) hangReport(pgdb string) string {
+	var b strings.Builder
+	out, _, _ := e.run("exec", pgdb, "--", "psql", "-X", "-c",
+		"select pid, state, wait_event, client_port, now() - state_change as for, left(query, 60) as query from pg_stat_activity where backend_type = 'client backend'")
+	b.WriteString(out)
+	port := e.status(pgdb).port
+	tcp, _ := os.ReadFile("/proc/net/tcp")
+	hex := fmt.Sprintf(":%04X", port)
+	b.WriteString("host TCP sockets on the server's port (local remote state tx:rx queues):\n")
+	for _, l := range strings.Split(string(tcp), "\n") {
+		f := strings.Fields(l)
+		if len(f) > 4 && (strings.HasSuffix(f[1], hex) || strings.HasSuffix(f[2], hex)) {
+			fmt.Fprintf(&b, "  %s %s %s %s\n", f[1], f[2], f[3], f[4])
+		}
+	}
+	return b.String()
 }
 
 // pgbenchConsistent checks pgbench's own invariant: every transaction adds
@@ -783,7 +836,12 @@ func TestStressLostUpdates(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conn := e.connect(url)
+			conn, err := connectErr(url)
+			if err != nil {
+				t.Errorf("connect: %v", err)
+				failed.Add(each)
+				return
+			}
 			defer conn.Close(context.Background())
 			for j := 0; j < each; j++ {
 				if _, err := conn.Exec(context.Background(), "update ctr set n = n + 1 where id = 1"); err != nil {
@@ -805,7 +863,11 @@ func TestStressLostUpdates(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			conn := e.connect(url)
+			conn, err := connectErr(url)
+			if err != nil {
+				t.Errorf("connect: %v", err)
+				return
+			}
 			defer conn.Close(context.Background())
 			ctx := context.Background()
 			for j := 0; j < 100; j++ {
