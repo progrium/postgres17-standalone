@@ -3,9 +3,16 @@
 //! removing what earlier layers put there. std.tar has no hard links,
 //! which image layers use, so this reads the headers itself (ustar, GNU
 //! long names, PAX path and size).
+//!
+//! Windows lets only an administrator, or Developer Mode, make a symlink,
+//! so there a layer's symlinks become hard links to their targets (copies
+//! for directories), resolved inside the root once the layer is applied.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+
+const is_windows = builtin.os.tag == .windows;
 
 const block = 512;
 
@@ -124,6 +131,7 @@ pub fn apply(gpa: std.mem.Allocator, io: Io, dest: Io.Dir, tar: *Io.Reader) !voi
     defer arena_state.deinit();
     var t: Reader = .{ .r = tar, .arena = arena_state.allocator() };
     var buf: [64 << 10]u8 = undefined;
+    var links: std.ArrayList(Link) = .empty;
     while (try t.next()) |e| {
         if (e.name.len == 0) continue;
         if (!safe(e.name)) return error.UnsafePath;
@@ -157,7 +165,9 @@ pub fn apply(gpa: std.mem.Allocator, io: Io, dest: Io.Dir, tar: *Io.Reader) !voi
             },
             '2' => {
                 dest.deleteTree(io, e.name) catch {};
-                try dest.symLink(io, e.link, e.name, .{});
+                if (is_windows) {
+                    try links.append(t.arena, .{ .name = e.name, .target = e.link });
+                } else try dest.symLink(io, e.link, e.name, .{});
             },
             '1' => {
                 if (!safe(e.link)) return error.UnsafePath;
@@ -183,9 +193,69 @@ pub fn apply(gpa: std.mem.Allocator, io: Io, dest: Io.Dir, tar: *Io.Reader) !voi
             else => {}, // devices, fifos: not needed in a root
         }
     }
+    if (links.items.len > 0) try materialize(t.arena, io, dest, links.items);
+}
+
+/// A symlink not made yet: `name` links to `target`.
+const Link = struct { name: []const u8, target: []const u8 };
+
+/// Makes each link a hard link to the file it resolves to inside `dest`,
+/// or a copy of the directory. A link to a link waits for that one; a
+/// link to nothing is left out.
+fn materialize(arena: std.mem.Allocator, io: Io, dest: Io.Dir, links: []Link) !void {
+    var pending = links;
+    var pass: u32 = 0;
+    while (pending.len > 0 and pass < 16) : (pass += 1) {
+        var left: usize = 0;
+        for (pending) |l| {
+            const target = try resolveLink(arena, l.name, l.target);
+            const st = dest.statFile(io, target, .{}) catch {
+                pending[left] = l;
+                left += 1;
+                continue;
+            };
+            dest.deleteTree(io, l.name) catch {};
+            if (st.kind == .directory) {
+                try copyTree(arena, io, dest, target, l.name);
+            } else {
+                dest.hardLink(target, dest, l.name, io, .{}) catch
+                    try dest.copyFile(target, dest, l.name, io, .{});
+            }
+        }
+        if (left == pending.len) break;
+        pending = pending[0..left];
+    }
+}
+
+/// Where a link resolves in the root: an absolute target from the top, a
+/// relative one from the link's directory, with `..` stopping at the top.
+fn resolveLink(arena: std.mem.Allocator, name: []const u8, target: []const u8) ![]const u8 {
+    const dir = std.fs.path.dirnamePosix(name) orelse "";
+    const abs = if (std.mem.startsWith(u8, target, "/"))
+        try std.fs.path.resolvePosix(arena, &.{ "/", target })
+    else
+        try std.fs.path.resolvePosix(arena, &.{ "/", dir, target });
+    return std.mem.trimStart(u8, abs, "/");
+}
+
+/// Copies the tree at `from` to `to`, both in `dest`.
+fn copyTree(arena: std.mem.Allocator, io: Io, dest: Io.Dir, from: []const u8, to: []const u8) !void {
+    try dest.createDirPath(io, to);
+    var src = try dest.openDir(io, from, .{ .iterate = true });
+    defer src.close(io);
+    var out = try dest.openDir(io, to, .{});
+    defer out.close(io);
+    var w = try src.walk(arena);
+    defer w.deinit();
+    while (try w.next(io)) |e| switch (e.kind) {
+        .directory => try out.createDirPath(io, e.path),
+        .file => try src.copyFile(e.path, out, e.path, io, .{}),
+        else => {},
+    };
 }
 
 fn setMode(arena: std.mem.Allocator, dest: Io.Dir, name: []const u8, mode: u32) void {
+    if (is_windows) return;
     const z = arena.dupeZ(u8, name) catch return;
     _ = std.c.fchmodat(dest.handle, z, @intCast(mode), 0);
 }
@@ -214,6 +284,17 @@ test "reader parses ustar and pax" {
     try std.testing.expect(!safe("../x"));
     try std.testing.expect(!safe("a/../../x"));
     try std.testing.expect(safe("a/b"));
+}
+
+test resolveLink {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("bin/busybox", try resolveLink(a, "usr/sbin/chroot", "/bin/busybox"));
+    try std.testing.expectEqualStrings("usr/lib/libz.so.1.3.2", try resolveLink(a, "usr/lib/libz.so.1", "libz.so.1.3.2"));
+    try std.testing.expectEqualStrings("run", try resolveLink(a, "var/run", "../run"));
+    try std.testing.expectEqualStrings("etc/crontabs", try resolveLink(a, "var/spool/cron/crontabs", "../../../etc/crontabs"));
+    try std.testing.expectEqualStrings("x", try resolveLink(a, "a", "../../x"));
 }
 
 fn makeHeader(h: *[block]u8, name: []const u8, kind: u8, size: usize, link: []const u8) void {

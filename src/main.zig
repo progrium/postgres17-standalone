@@ -4,8 +4,8 @@
 //! on it. minipg embeds Docker Hub's postgres:<major>-alpine image as a
 //! Linux root and runs it with hyper9 (h9) as a library: h9's Linux
 //! personality runs Alpine's own Postgres binaries on the host's hypervisor
-//! (HVF on macOS, KVM on Linux) or on h9's native backend (x86_64 Linux
-//! without KVM). Postgres listens on a host loopback port directly; psql
+//! (HVF on macOS, KVM on Linux, WHP on Windows) or on h9's native backend
+//! (x86_64 Linux without KVM). Postgres listens on a host loopback port directly; psql
 //! and the other tools run in their own short-lived machines and connect
 //! over loopback.
 
@@ -17,9 +17,6 @@ const commands = @import("commands.zig");
 const paths = @import("paths.zig");
 const Ctx = @import("ctx.zig").Ctx;
 
-comptime {
-    if (builtin.os.tag == .windows) @compileError("minipg needs a POSIX host for now");
-}
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -52,7 +49,7 @@ pub fn main(init: std.process.Init) !u8 {
         .arena = arena,
         .io = io,
         .env = init.environ_map,
-        .dirs = paths.dirs(arena, init.environ_map) catch return fail("HOME isn't set"),
+        .dirs = paths.dirs(arena, init.environ_map) catch return fail(paths.home_var ++ " isn't set"),
         .version = build_options.version,
     };
     return run(ctx, args) catch |err| {
@@ -104,4 +101,5 @@ test {
     _ = @import("layer.zig");
     _ = @import("https.zig");
     _ = @import("roots.zig");
+    _ = @import("sys.zig");
 }

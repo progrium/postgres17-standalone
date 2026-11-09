@@ -7,11 +7,11 @@
 //! connects. That server stops after MINIPG_IDLE seconds without clients.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Ctx = @import("ctx.zig").Ctx;
 const pgdb_mod = @import("pgdb.zig");
 const paths = @import("paths.zig");
 const control = @import("control.zig");
+const sys = @import("sys.zig");
 
 const Pgdb = pgdb_mod.Pgdb;
 
@@ -39,33 +39,13 @@ pub fn find(ctx: Ctx, p: Pgdb) !?Running {
         if (control.readRunInfo(ctx.arena, ctx.io, runtime)) |info| {
             // A killed server's guest processes can hold the lock for a few
             // seconds after it's gone; wait them out.
-            if (alive(info.pid)) return .{ .info = info, .runtime = runtime };
+            if (sys.alive(info.pid)) return .{ .info = info, .runtime = runtime };
             if (tries > 400) return error.StaleLock;
         } else |_| {
             if (tries > 100) return error.NoRunInfo;
         }
         try ctx.io.sleep(.fromMilliseconds(50), .awake);
     }
-}
-
-/// Whether `pid` is a live process: not gone, and not a zombie waiting
-/// for a parent to reap it.
-fn alive(pid: i32) bool {
-    if (pid <= 0) return true;
-    if (std.c.kill(pid, @enumFromInt(0)) != 0 and std.c._errno().* == @intFromEnum(std.c.E.SRCH)) return false;
-    if (builtin.os.tag != .linux) return true;
-    var path: [32:0]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid}) catch return true;
-    const fd = std.c.open(z, .{});
-    if (fd < 0) return true;
-    defer _ = std.c.close(fd);
-    var buf: [512]u8 = undefined;
-    const n = std.c.read(fd, &buf, buf.len);
-    if (n <= 0) return true;
-    // "pid (comm) S ...": the state follows the last ')'.
-    const stat = buf[0..@intCast(n)];
-    const i = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return true;
-    return !(i + 2 < stat.len and stat[i + 2] == 'Z');
 }
 
 /// Asks a running server for its status.
@@ -94,12 +74,13 @@ pub fn ensure(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !Running {
     }
     var r: Running = .{ .info = undefined, .runtime = try runtimeDir(ctx, p) };
     r.child = try spawn(ctx, p, opts);
+    const child_pid = sys.childPid(r.child.?);
     // Wait for run.json, then for ready.
     var tries: u32 = 0;
     while (true) : (tries += 1) {
-        if (try exited(&r.child.?)) |code| return serverFailed(ctx, p, code);
+        if (sys.childExited(&r.child.?)) |code| return serverFailed(ctx, p, code);
         if (control.readRunInfo(ctx.arena, ctx.io, r.runtime)) |info| {
-            if (info.pid == r.child.?.id.?) {
+            if (info.pid == child_pid) {
                 r.info = info;
                 break;
             }
@@ -119,21 +100,12 @@ fn spawn(ctx: Ctx, p: Pgdb, opts: EnsureOptions) !std.process.Child {
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-        // Its own process group, so a Ctrl-C meant for psql doesn't stop it.
-        .pgid = 0,
+        // Its own process group, so a Ctrl-C meant for psql doesn't stop it;
+        // on Windows its own hidden console, which closing this one's
+        // doesn't end either.
+        .pgid = if (sys.is_windows) null else 0,
+        .create_no_window = sys.is_windows,
     });
-}
-
-/// The exit code of a child that has exited, without waiting.
-fn exited(child: *std.process.Child) !?u8 {
-    const pid = child.id orelse return 0;
-    var st: c_int = 0;
-    const rc = std.c.waitpid(pid, &st, std.c.W.NOHANG);
-    if (rc == 0) return null;
-    child.id = null;
-    if (rc < 0) return 1;
-    const u: u32 = @bitCast(st);
-    return if (std.c.W.IFEXITED(u)) std.c.W.EXITSTATUS(u) else 1;
 }
 
 fn serverFailed(ctx: Ctx, p: Pgdb, code: u8) error{ServerFailed} {
@@ -168,7 +140,7 @@ fn waitReady(ctx: Ctx, r: Running, starting: ?Pgdb) !void {
     while (tries < 3000) : (tries += 1) {
         if (r.child) |ch| {
             var copy = ch;
-            if (try exited(&copy)) |code| return serverFailed(ctx, starting.?, code);
+            if (sys.childExited(&copy)) |code| return serverFailed(ctx, starting.?, code);
         }
         if (status(ctx, r)) |st| {
             if (std.mem.eql(u8, st.state, "ready")) return;

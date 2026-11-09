@@ -5,6 +5,7 @@
 //!   zig build run -- app.pgdb          build and run it
 //!   zig build test                     unit tests
 //!   zig build -Dtarget=aarch64-linux-musl
+//!   zig build -Dtarget=x86_64-windows
 //!
 //! The binary embeds assets/root-<arch>.tar.xz, the Linux root for the
 //! target's architecture, and assets/root-<arch>.json, what it is; `make
@@ -13,7 +14,14 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Windows 10 1803 at least: the first with AF_UNIX sockets (the control
+    // socket) and the Windows Hypervisor Platform.
+    var query = b.standardTargetOptionsQueryOnly(.{});
+    if (b.resolveTargetQuery(query).result.os.tag == .windows and query.os_version_min == null) {
+        query.os_tag = .windows;
+        query.os_version_min = .{ .windows = .win10_rs4 };
+    }
+    const target = b.resolveTargetQuery(query);
     const optimize = b.standardOptimizeOption(.{});
     const os = target.result.os.tag;
 
@@ -29,7 +37,7 @@ pub fn build(b: *std.Build) void {
     const meta_path = b.fmt("{s}.json", .{root_path[0 .. root_path.len - ".tar.xz".len]});
 
     // No GUI: the machine has no screen. Unicorn (GPLv2) stays out, so the
-    // binary runs on the host's hypervisor (HVF, KVM) or h9's native
+    // binary runs on the host's hypervisor (HVF, KVM, WHP) or h9's native
     // backend on x86_64 Linux.
     const h9 = b.dependency("h9", .{
         .target = target,

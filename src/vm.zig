@@ -7,6 +7,7 @@ const std = @import("std");
 const h9 = @import("h9");
 const host = @import("host.zig");
 const root_mod = @import("roots.zig");
+const sys = @import("sys.zig");
 
 /// Postgres's data directory in the guest: `pgdata` in the .pgdb, which is
 /// the server machine's cwd.
@@ -75,8 +76,8 @@ pub const RunResult = struct {
 /// Runs Postgres in a server machine until it exits.
 pub fn runServer(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r: ServerRun) RunResult {
     const opts: h9.Machine.Options = .{
-        .linux_root = r.root.dir,
-        .cwd = r.pgdb,
+        .linux_root = sys.kernPath(arena, r.root.dir) catch r.root.dir,
+        .cwd = sys.kernPath(arena, r.pgdb) catch r.pgdb,
         .env = r.env,
         .guest_tools = false,
         .builtin = .off,
@@ -132,10 +133,13 @@ pub fn runTool(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.E
     defer env.deinit(gpa);
     try env.appendSlice(gpa, r.env);
     if (tty) try env.append(gpa, .{ .name = "TERM", .value = env_map.get("TERM") orelse "xterm" });
+    if (tty) terminal.enableVt();
 
+    var path_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer path_arena.deinit();
     const opts: h9.Machine.Options = .{
-        .linux_root = r.root.dir,
-        .cwd = r.cwd,
+        .linux_root = try sys.kernPath(path_arena.allocator(), r.root.dir),
+        .cwd = try sys.kernPath(path_arena.allocator(), r.cwd),
         .env = env.items,
         .guest_tools = false,
         .builtin = .off,
