@@ -1,0 +1,12 @@
+.DS_Store
+/.zig-cache
+/zig-out
+/.zig-out
+/.local
+/dist
+/data
+/minipg
+/assets/*.tar.xz
+/assets/*.json
+/.dev/build
+/.dev/tmp

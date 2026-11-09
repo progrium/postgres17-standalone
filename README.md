@@ -1,0 +1,117 @@
+# minipg
+
+PostgreSQL as a file. One binary, nothing to install or configure: a `.pgdb` is the database, and `minipg app.pgdb` opens a shell on it.
+
+```sh
+minipg app.pgdb                          # psql shell (creates app.pgdb if missing)
+minipg app.pgdb "select 1"               # one statement
+minipg url app.pgdb                      # postgres://postgres:...@127.0.0.1:54321/app for your app
+minipg serve app.pgdb                    # an explicit foreground server
+minipg exec app.pgdb -- pg_dump -f dump.sql
+```
+
+minipg embeds Docker Hub's `postgres:18-alpine` image and runs it with [hyper9](https://github.com/progrium/hyper9) (h9), used as a Zig library. h9's Linux personality runs Alpine's own Postgres binaries directly on the host's hypervisor, with h9's Plan 9 kernel answering their system calls. There's no Linux kernel to boot, no VM image, and no Docker.
+
+> **Early.** h9 is a research prototype and its Linux personality is young. See [Known limits](#known-limits) before trusting it with data you can't recreate.
+
+## The .pgdb
+
+A `.pgdb` is a directory:
+
+```
+app.pgdb/
+  minipg.toml   settings and the generated superuser password (mode 0600)
+  pgdata/       Postgres's data directory, as plain files
+  .lock         held by the server while it runs
+```
+
+Data, config, credentials and the Postgres version live inside it; nothing is written next to it. A stopped `.pgdb` can be copied like any directory. While a server runs, use `pg_dump` (`minipg exec app.pgdb -- pg_dump`), since a raw copy isn't guaranteed consistent.
+
+`minipg.toml` records the layout `format`, the Postgres major, variant (alpine), arch and image digest, the superuser and its generated password, the default database (named after the file: `app.pgdb` has `app`), and the preferred port, picked at init.
+
+New clusters use Postgres's builtin `C.UTF-8` locale, which sorts the same on every platform and never changes between versions, so indexes on text can't be invalidated by a libc update.
+
+## Commands
+
+Every command takes the `.pgdb` first; a bare path is shorthand for `shell`. `-d DB` picks another database.
+
+| Command | What it does |
+|---|---|
+| `minipg <pgdb> [sql]`, `shell <pgdb\|url> [sql]` | psql on the `.pgdb` (or any `postgres://` URL), or run the statements given |
+| `init <pgdb> [--port N] [--user U]` | Create a `.pgdb` and initialize its cluster (about 4s); refuses if the path exists |
+| `serve <pgdb> [-p PORT] [--listen ADDR] [--log FILE] [--trust] [-- postgres args]` | Run the server in the foreground; Ctrl-C stops it |
+| `stop <pgdb>` | Stop its server cleanly |
+| `status <pgdb>` | Running or not, port, clients, uptime; exits 3 when stopped |
+| `url <pgdb>` | A `postgres://` URL with the password |
+| `logs <pgdb> [-f]` | The server's recent log (a 4 MB window), or the last server's log file |
+| `exec <pgdb> -- TOOL [args]` | Run a Postgres tool (pg_dump, pg_restore, psql, ...) against the server, with `PG*` set |
+
+`shell`, `url` and the bare form create a missing `.pgdb` with defaults. `init` takes `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` as defaults, and passes `POSTGRES_INITDB_ARGS`, `POSTGRES_INITDB_WALDIR` and `TZ` through to the image as Docker would.
+
+### Servers
+
+Exactly one process runs Postgres for a `.pgdb`, enforced by the lock. Commands never host Postgres themselves: if no server is running, they start one in the background and use it. Back-to-back commands share it, and it stops after `MINIPG_IDLE` seconds (default 60) without client connections. `serve` runs one in the foreground with no idle timeout.
+
+Postgres listens on a host port directly, on `127.0.0.1` unless `--listen` says otherwise. The port stored at init is used when it's free; otherwise the server picks another, and `url` reports the one in use. Apps authenticate with SCRAM and the generated password. `serve --trust` lets loopback clients in without one, and is refused with a non-loopback `--listen`.
+
+psql, pg_dump and the other tools run in their own short-lived h9 machine (about 90 ms to start) over the same root, and connect to the server over loopback. Their working directory is yours, so `pg_dump -f dump.sql` writes where you are.
+
+### Files outside the .pgdb
+
+| What | Linux | macOS |
+|---|---|---|
+| Runtime (run.json, control socket) | `$XDG_RUNTIME_DIR/minipg/<key>/` | `$TMPDIR/minipg-$UID/<key>/` |
+| Logs | `~/.local/state/minipg/logs/<key>.log` | `~/Library/Logs/minipg/<key>.log` |
+| Unpacked roots | `~/.cache/minipg/roots/<digest>/` | `~/Library/Caches/minipg/roots/<digest>/` |
+
+`<key>` is a hash of the `.pgdb` directory's device and inode. Linux falls back to `~/.cache/minipg/run/` without `XDG_RUNTIME_DIR`, and honors `XDG_STATE_HOME` and `XDG_CACHE_HOME`. The first run unpacks the embedded root (about 90 MB, a few seconds).
+
+## Platforms
+
+| Platform | h9 backend | Needs | Tested |
+|---|---|---|---|
+| Linux x86_64 | KVM, or h9's native backend without it | Linux 5.11 or later | Yes, native backend |
+| Linux arm64 | KVM | read/write `/dev/kvm` | Builds; not run |
+| macOS (Apple Silicon) | Hypervisor.framework | the hypervisor entitlement (the build signs ad hoc) | Not run |
+
+Linux builds are static musl binaries, so one runs on glibc distros and Alpine alike.
+
+## How it works
+
+- [src/server.zig](src/server.zig) is the server process. It holds the `.pgdb`'s lock, picks the port, writes `run.json`, serves the control socket, and runs Postgres in an h9 machine whose Linux root is the unpacked image and whose writable cwd is the `.pgdb` (`/mnt/term/cwd` in the guest). The image's `docker-entrypoint.sh` initializes the cluster on first start. A monitor thread logs in to see when Postgres is ready, then counts clients in `pg_stat_activity` for `status` and the idle timeout.
+- To stop, the server tells a small supervisor shell in the machine, which sends SIGINT (a fast shutdown) to the postmaster alone. h9's interrupt note would reach every process in the machine, and Postgres's children act on SIGINT themselves, which can leave the postmaster waiting forever. A second Ctrl-C, or 30 seconds, tears the machine down; Postgres recovers from its WAL on the next start.
+- [src/control.zig](src/control.zig) is the control protocol: one versioned request line over a unix socket (`status`, `stop`, `logs [follow]`, `clients`).
+- [src/client.zig](src/client.zig) finds a running server or starts one; [src/vm.zig](src/vm.zig) builds the server and tool machines; [src/pgwire.zig](src/pgwire.zig) is the small Postgres client (SCRAM-SHA-256, simple queries) the server uses on the host.
+
+## Building
+
+Requires [Zig 0.16](https://ziglang.org/download/), and for the root `curl`, `jq`, `tar` and `xz`. hyper9 is a git submodule, since it can't be fetched as a Zig package yet:
+
+```sh
+git submodule update --init
+make build                       # pulls the root for this host's arch, builds ./minipg
+make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos; ARCH: amd64, arm64)
+make root ARCH=arm64             # just assets/root-arm64.tar.xz and .json
+make build PG_MAJOR=17           # embed another major
+make dist VERSION=v0.4           # dist/minipg_v0.4_<os>_<arch>.zip
+```
+
+[scripts/root.sh](scripts/root.sh) pulls the image from Docker Hub's registry, drops what a server doesn't need (LLVM for JIT, headers, docs), and records the image's digest, version and ENV beside the tarball. JIT is therefore unavailable, and minipg sets `jit=off`. macOS builds have to be made on a Mac (for the SDK's Hypervisor framework).
+
+## Testing
+
+```sh
+make test     # unit tests
+make e2e      # builds ./minipg, then drives it end to end (.dev/e2e, Go)
+```
+
+## Known limits
+
+- **Directory fsync.** h9 silently skips fsync on directories ([hyper9#112](https://github.com/progrium/hyper9/issues/112)), so a crash or power loss right after Postgres renames or creates a file can lose that change. File fsyncs (WAL, data files) do reach the disk.
+- **Speed.** On h9's native backend (x86_64 Linux without KVM), Postgres is about 2x slower than native for one client and 6 to 12x under load, and a new connection costs about 27 ms. Apps that don't pool connections will feel it. KVM and HVF haven't been measured.
+- **Log noise.** h9 logs "process exceeds N file descriptors" while Postgres probes its fd limit; it's harmless.
+- **Cross-arch.** A `.pgdb` records the arch it was created on, and the server warns when it's opened on another.
+
+## License
+
+MIT

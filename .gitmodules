@@ -1,0 +1,3 @@
+[submodule "deps/hyper9"]
+	path = deps/hyper9
+	url = https://github.com/progrium/hyper9
