@@ -7,10 +7,6 @@ name: pages
 on:
   push:
     branches: [main]
-  # A pull request that touches the site or the demo builds and tests it,
-  # without deploying.
-  pull_request:
-    paths: [site/**, web/**, src/**, deps/**, build.zig, Makefile, .github/workflows/pages.yml]
   workflow_dispatch:
 
 permissions:
@@ -20,7 +16,7 @@ permissions:
 
 # One deploy at a time, always the newest main.
 concurrency:
-  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  group: pages
   cancel-in-progress: true
 
 jobs:
@@ -66,7 +62,6 @@ jobs:
           path: _site
 
   deploy:
-    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
