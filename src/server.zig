@@ -129,6 +129,9 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     if (!std.mem.eql(u8, p.config.pg_arch, roots.host_arch) and p.config.pg_arch.len > 0)
         log.note("warning: {s} was created on {s} and this host is {s}; Postgres doesn't promise its data files carry across", .{ p.name(), p.config.pg_arch, roots.host_arch });
 
+    const backend = vm.backendFrom(ctx.env) catch
+        return ctx.fail("MINIPG_BACKEND must be auto, native, kvm, hvf, or whp", .{});
+
     var sig: host.Signals = undefined;
     try sig.init(io, .server, &log.interface);
     defer sig.deinit();
@@ -150,7 +153,7 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         .log = log,
         .sig = &sig,
         .started = std.Io.Clock.real.now(io).toSeconds(),
-        .backend = @tagName(h9.vmm.BackendKind.auto),
+        .backend = @tagName(backend),
     };
 
     // The control socket, then run.json, which points at it.
@@ -220,6 +223,7 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         .argv = argv.items,
         .log = &log.interface,
         .signals = &sig.machine,
+        .backend = backend,
         .in = &stop_in.interface,
         .in_cancel = stop_in.cancelHook(),
     });
@@ -343,6 +347,8 @@ pub fn initialize(ctx: Ctx, p: Pgdb) !u8 {
     try extra.append(arena, .{ .name = "MINIPG_INIT", .value = init_script });
     const env = try vm.environment(arena, root.meta, extra.items);
 
+    const backend = vm.backendFrom(ctx.env) catch
+        return ctx.fail("MINIPG_BACKEND must be auto, native, kvm, hvf, or whp", .{});
     var sig: host.Signals = undefined;
     try sig.init(io, .server, &log.interface);
     defer sig.deinit();
@@ -354,6 +360,7 @@ pub fn initialize(ctx: Ctx, p: Pgdb) !u8 {
         .argv = &.{ "bash", "-c", init_script, "minipg-init" },
         .log = &log.interface,
         .signals = &sig.machine,
+        .backend = backend,
     });
     if (result.stuck) std.process.exit(1);
     const st = result.status orelse {

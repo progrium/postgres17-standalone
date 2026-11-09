@@ -28,7 +28,42 @@ jobs:
           key: root-amd64-${{ hashFiles('scripts/root.sh', 'Makefile') }}
       - name: Unit tests
         run: make test
+      # No KVM on GitHub's runners: h9's native backend, which minipg uses
+      # only when asked, since it isn't a sandbox.
       - name: End-to-end tests
         run: make e2e
+        env:
+          MINIPG_BACKEND: native
       - name: Cross-compile linux/arm64
         run: make build OS=linux ARCH=arm64 OUT=minipg-arm64
+      - name: Cross-compile windows/amd64
+        run: make build OS=windows ARCH=amd64 OUT=minipg.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minipg-windows-amd64
+          path: minipg.exe
+      # The Windows job embeds the same root.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-amd64
+          path: assets/root-amd64.*
+
+  # Unit tests on Windows. GitHub's runners have no Windows Hypervisor
+  # Platform, so Postgres itself doesn't run here.
+  windows-amd64:
+    needs: linux-amd64
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: root-amd64
+          path: assets
+      - name: Unit tests
+        run: zig build test

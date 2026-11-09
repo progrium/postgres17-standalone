@@ -4,6 +4,7 @@
 //! cwd go to an overlay in memory and vanish when it exits.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const h9 = @import("h9");
 const host = @import("host.zig");
 const root_mod = @import("roots.zig");
@@ -46,8 +47,21 @@ pub fn exitCode(status: h9.Status) u8 {
     };
 }
 
-fn unavailable(err: anyerror) []const u8 {
-    return h9.vmm.whyUnavailable(.auto) orelse @errorName(err);
+/// The backend MINIPG_BACKEND names: auto (the default) uses the host's
+/// hypervisor. h9's native backend (x86_64 Linux without KVM) runs the
+/// guest in minipg's own process, where a guest that escapes Postgres can
+/// reach the host, so it's never picked by itself.
+pub fn backendFrom(env: *const std.process.Environ.Map) !h9.vmm.BackendKind {
+    const v = env.get("MINIPG_BACKEND") orelse return .auto;
+    if (v.len == 0) return .auto;
+    return std.meta.stringToEnum(h9.vmm.BackendKind, v) orelse error.BadBackend;
+}
+
+fn unavailable(arena: std.mem.Allocator, kind: h9.vmm.BackendKind, err: anyerror) []const u8 {
+    const why = h9.vmm.whyUnavailable(kind) orelse @errorName(err);
+    if (kind == .auto and builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
+        return std.fmt.allocPrint(arena, "{s}; MINIPG_BACKEND=native runs Postgres on h9's native backend instead, which isn't a sandbox", .{why}) catch why;
+    return why;
 }
 
 pub const ServerRun = struct {
@@ -61,6 +75,7 @@ pub const ServerRun = struct {
     /// Receives Postgres's stdout and stderr.
     log: *std.Io.Writer,
     signals: *h9.Machine.Signals,
+    backend: h9.vmm.BackendKind = .auto,
     /// The machine's console input, if any.
     in: ?*std.Io.Reader = null,
     in_cancel: ?h9.consin.Cancel = null,
@@ -81,6 +96,7 @@ pub fn runServer(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r
         .env = r.env,
         .guest_tools = false,
         .builtin = .off,
+        .backend = r.backend,
         .console_tty = false,
         .policy = .{
             // Postgres listens on the host's own ports.
@@ -92,7 +108,7 @@ pub fn runServer(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r
         .stdio = .{ .out = r.log, .err = r.log, .in = r.in, .in_cancel = r.in_cancel },
     };
     var machine = h9.Machine.init(gpa, io, opts) catch |err|
-        return .{ .status = null, .err_msg = std.fmt.allocPrint(arena, "cannot create a machine: {s} ({t})", .{ unavailable(err), err }) catch "cannot create a machine" };
+        return .{ .status = null, .err_msg = std.fmt.allocPrint(arena, "cannot create a machine: {s} ({t})", .{ unavailable(arena, r.backend, err), err }) catch "cannot create a machine" };
     defer machine.deinit();
     const prog: h9.Program = .{ .guest = r.prog };
     const status = machine.run(prog, r.argv) catch |err| {
@@ -115,6 +131,10 @@ pub const ToolRun = struct {
 /// Runs a tool such as psql in a fresh machine with the caller's stdio,
 /// and returns its exit code.
 pub fn runTool(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.Environ.Map, r: ToolRun) !u8 {
+    const backend = backendFrom(env_map) catch {
+        std.debug.print("minipg: MINIPG_BACKEND must be auto, native, kvm, hvf, or whp\n", .{});
+        return 2;
+    };
     var terminal: host.Terminal = .{};
     defer terminal.restore();
     const tty = r.in == null and (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
@@ -143,6 +163,7 @@ pub fn runTool(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.E
         .env = env.items,
         .guest_tools = false,
         .builtin = .off,
+        .backend = backend,
         .console_tty = tty,
         .policy = .{
             .net = .enable,
@@ -159,7 +180,7 @@ pub fn runTool(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.process.E
         },
     };
     var machine = h9.Machine.init(gpa, io, opts) catch |err| {
-        std.debug.print("minipg: cannot create a machine: {s} ({t})\n", .{ unavailable(err), err });
+        std.debug.print("minipg: cannot create a machine: {s} ({t})\n", .{ unavailable(path_arena.allocator(), backend, err), err });
         return 1;
     };
     defer machine.deinit();
