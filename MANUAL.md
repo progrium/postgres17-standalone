@@ -454,6 +454,8 @@ KVM (on Linux) and Hypervisor.framework (on macOS) avoid the native backend's ma
 
 **What's tested.** minipg's end-to-end suite kills the server with `kill -9` in the middle of writes, restarts it, and checks that Postgres recovers from its WAL and that `amcheck` finds no index corruption. File `fsync` calls, directory `fsync` calls, and `sync` all reach the host's disk, so Postgres's own durability rules hold: a committed transaction survives a crash of minipg or of Postgres.
 
+**The stress suite.** `make stress` goes further, outside CI: it kills a server with `kill -9` many times over while writers commit, six ways (the whole process tree, the minipg server alone, one h9 stub, the postmaster, the backends, and the WAL writer and checkpointer), and checks after each that every acknowledged commit survived and nothing unacknowledged did. It also crashes bulk loads and pgbench runs, copies a crashed `.pgdb`, soaks under pgbench, exhausts connections, memory, and disk, and dumps and restores under load. Every cluster has data checksums, and every check ends with `amcheck` and `pg_checksums`. See [.dev/e2e/stress_test.go](.dev/e2e/stress_test.go) for its knobs.
+
 **What isn't.** Power loss and kernel crashes haven't been tested. Neither KVM, Hypervisor.framework, nor arm64 has been crash-tested yet.
 
 **Killed servers.** On the native backend, each Postgres process is its own host process. If the server process is killed outright (SIGKILL, or the OOM killer), those processes live on for a few seconds before exiting, and the `.pgdb` stays locked until they do. A command that wants a server waits for the lock and then starts one, and Postgres recovers from its WAL.
@@ -671,6 +673,7 @@ make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos; ARCH: amd64,
 make build PG_MAJOR=17           # embed another major
 make test                        # unit tests
 make e2e                         # end-to-end tests against ./minipg
+make stress                      # the stress suite (slow; STRESS_ROUNDS, STRESS_SOAK)
 ```
 
 macOS builds have to be made on a Mac, for the SDK's Hypervisor framework. See the README's [Building](README.md#building) section for more.
