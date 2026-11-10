@@ -1,6 +1,7 @@
 //! The commands.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const h9 = @import("h9");
 const native = @import("build_options").native;
 const Ctx = @import("ctx.zig").Ctx;
@@ -374,12 +375,14 @@ fn literal(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Shell-quotes a value for `env`'s exports.
+/// Shell-quotes a value for `env`'s exports: for sh, or on Windows for
+/// PowerShell, where a quote inside single quotes is doubled.
 fn shellQuote(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const quote = if (builtin.os.tag == .windows) "''" else "'\\''";
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '\'');
     for (s) |ch| {
-        if (ch == '\'') try out.appendSlice(arena, "'\\''") else try out.append(arena, ch);
+        if (ch == '\'') try out.appendSlice(arena, quote) else try out.append(arena, ch);
     }
     try out.append(arena, '\'');
     return out.items;
@@ -392,8 +395,10 @@ pub fn envCmd(ctx: Ctx, args: cli.Args) !u8 {
     var buf: [1024]u8 = undefined;
     var out = ctx.stdout(&buf);
     const w = &out.interface;
-    try w.print("export DATABASE_URL={s}\n", .{try shellQuote(ctx.arena, try conn.url(ctx.arena))});
-    for (try conn.pgEnv(ctx.arena)) |v| try w.print("export {s}={s}\n", .{ v.name, try shellQuote(ctx.arena, v.value) });
+    // PowerShell's syntax on Windows: minipg env app.pgdb | Invoke-Expression.
+    const fmt = if (builtin.os.tag == .windows) "$env:{s} = {s}\n" else "export {s}={s}\n";
+    try w.print(fmt, .{ "DATABASE_URL", try shellQuote(ctx.arena, try conn.url(ctx.arena)) });
+    for (try conn.pgEnv(ctx.arena)) |v| try w.print(fmt, .{ v.name, try shellQuote(ctx.arena, v.value) });
     try w.flush();
     return 0;
 }
@@ -440,7 +445,7 @@ pub fn restore(ctx: Ctx, args: cli.Args) !u8 {
     const p = openOrCreate(ctx, args, path) orelse return 1;
     const db = args.flag(&.{ "d", "db" }) orelse p.config.database;
     var file: ?[]const u8 = if (args.positional.len > 1) try pgdb_mod.absolute(ctx.arena, ctx.io, args.positional[1]) else null;
-    var fd: std.posix.fd_t = std.posix.STDIN_FILENO;
+    var fd: host.Handle = host.stdinHandle();
     if (file) |f| {
         const h = std.Io.Dir.cwd().openFile(ctx.io, f, .{}) catch |err| return ctx.fail("{s}: {t}", .{ f, err });
         fd = h.handle;
@@ -461,10 +466,14 @@ pub fn restore(ctx: Ctx, args: cli.Args) !u8 {
     if (file == null) {
         var rnd: [8]u8 = undefined;
         ctx.io.random(&rnd);
-        const t = try std.fmt.allocPrint(ctx.arena, "{s}/minipg-restore-{x}", .{ ctx.getenv("TMPDIR") orelse "/tmp", &rnd });
+        const tmp_root = if (builtin.os.tag == .windows)
+            ctx.getenv("TEMP") orelse ctx.getenv("TMP") orelse return ctx.fail("TEMP isn't set", .{})
+        else
+            ctx.getenv("TMPDIR") orelse "/tmp";
+        const t = try std.fs.path.join(ctx.arena, &.{ tmp_root, try std.fmt.allocPrint(ctx.arena, "minipg-restore-{x}", .{&rnd}) });
         try paths.makePrivateDir(ctx.io, ctx.arena, t);
         tmp_dir = t;
-        const f = try std.fmt.allocPrint(ctx.arena, "{s}/dump", .{t});
+        const f = try std.fs.path.join(ctx.arena, &.{ t, "dump" });
         var out = try std.Io.Dir.cwd().createFile(ctx.io, f, .{});
         defer out.close(ctx.io);
         var wbuf: [64 << 10]u8 = undefined;

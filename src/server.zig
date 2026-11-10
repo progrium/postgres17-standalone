@@ -20,6 +20,7 @@ const pgwire = @import("pgwire.zig");
 const roots = @import("roots.zig");
 const vm = @import("vm.zig");
 const net = @import("net.zig");
+const sys = @import("sys.zig");
 
 const Pgdb = pgdb_mod.Pgdb;
 
@@ -76,7 +77,7 @@ const Server = struct {
     fn status(s: *Server, arena: std.mem.Allocator) control.Status {
         return .{
             .state = @tagName(s.state.load(.acquire)),
-            .pid = std.c.getpid(),
+            .pid = sys.pid(),
             .port = s.port,
             .listen = s.opts.listen,
             .socket = s.socket,
@@ -140,15 +141,12 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     defer sig.deinit();
 
     // The supervisor's stdin: a pipe the stop hook writes "stop" to.
-    var stop_pipe: [2]std.posix.fd_t = undefined;
-    if (std.c.pipe(&stop_pipe) != 0) return error.SystemResources;
-    defer for (stop_pipe) |fd| {
-        _ = std.c.close(fd);
-    };
+    var stop_pipe = try host.Pipe.init();
+    defer stop_pipe.close();
     var in_buf: [256]u8 = undefined;
     var stop_in: host.Stdin = undefined;
-    stop_in.initFd(stop_pipe[0], &in_buf);
-    sig.stop_hook = .{ .ctx = @ptrFromInt(@as(usize, @intCast(stop_pipe[1])) + 1), .func = writeStop };
+    stop_in.initFd(stop_pipe.r, &in_buf);
+    sig.stop_hook = .{ .ctx = &stop_pipe, .func = writeStop };
 
     var s: Server = .{
         .ctx = ctx,
@@ -179,7 +177,7 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
         std.Io.Dir.cwd().deleteFile(io, sock_path) catch {};
     }
     try control.writeRunInfo(arena, io, runtime, .{
-        .pid = std.c.getpid(),
+        .pid = sys.pid(),
         .port = port,
         .listen = opts.listen,
         .socket = s.socket,
@@ -191,7 +189,15 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
     const run_json = try control.runJsonPath(arena, runtime);
     defer std.Io.Dir.cwd().deleteFile(io, run_json) catch {};
 
-    (try std.Thread.spawn(.{}, acceptLoop, .{ &s, &listener })).detach();
+    const accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ &s, &listener });
+    // Before the listener closes: closing it under a pending accept cancels
+    // the accept, which std on Windows takes as unreachable (a panic). A
+    // connection of our own wakes it to see `done`.
+    defer {
+        s.done.store(true, .release);
+        if (ua.connect(io)) |c| c.close(io) else |_| {}
+        accept_thread.join();
+    }
     const monitor_thread = try std.Thread.spawn(.{}, monitor, .{&s});
 
     // The machine's environment and Postgres's command line.
@@ -218,13 +224,13 @@ pub fn serve(ctx: Ctx, p: Pgdb, opts: Options) !u8 {
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{
-        "bash",                                                                "-c",
-        supervisor,                                                            "minipg-server",
-        "postgres",                                                            "-c",
+        "bash",                                                                                         "-c",
+        supervisor,                                                                                     "minipg-server",
+        "postgres",                                                                                     "-c",
         try std.fmt.allocPrint(arena, "listen_addresses={s}", .{if (socket_only) "" else opts.listen}), "-c",
         try std.fmt.allocPrint(arena, "port={d}", .{port}),
         // The trimmed root has no LLVM, so JIT is never available.
-                           "-c",
+                                                    "-c",
         "jit=off",
     });
     const trust_hba = try p.sub(arena, ".trust_hba.conf");
@@ -304,10 +310,10 @@ fn socketOwner(dir: []const u8) void {
     _ = std.c.fchownat(std.c.AT.FDCWD, z, pw.uid, pw.gid, 0);
 }
 
-/// Asks the supervisor to stop Postgres. `ctx` is the pipe's write end + 1.
+/// Asks the supervisor to stop Postgres. `ctx` is the stop pipe.
 fn writeStop(ctx: *anyopaque) void {
-    const fd: std.posix.fd_t = @intCast(@intFromPtr(ctx) - 1);
-    _ = std.c.write(fd, "stop\n", 5);
+    const pipe: *host.Pipe = @ptrCast(@alignCast(ctx));
+    pipe.write("stop\n");
 }
 
 /// The server machine's environment beyond the image's: PGDATA and PGPORT,
@@ -602,11 +608,11 @@ fn handle(s: *Server, conn: std.Io.net.Stream) void {
     var w = conn.writer(io, &wbuf);
     const out = &w.interface;
     const line = (r.interface.takeDelimiter('\n') catch return) orelse return;
-    handleRequest(s, arena, line, out, conn.socket.handle) catch {};
+    handleRequest(s, arena, line, &r.interface, out) catch {};
     out.flush() catch {};
 }
 
-fn handleRequest(s: *Server, arena: std.mem.Allocator, line: []const u8, out: *std.Io.Writer, conn_fd: std.posix.fd_t) !void {
+fn handleRequest(s: *Server, arena: std.mem.Allocator, line: []const u8, in: *std.Io.Reader, out: *std.Io.Writer) !void {
     const io = s.ctx.io;
     const req = control.parseRequest(line) orelse return out.writeAll("error malformed request\n");
     if (req.version != control.protocol)
@@ -627,11 +633,7 @@ fn handleRequest(s: *Server, arena: std.mem.Allocator, line: []const u8, out: *s
         try out.writeAll("ok\n");
         try out.flush();
         // Until the client hangs up.
-        var b: [1]u8 = undefined;
-        while (true) {
-            const n = std.posix.read(conn_fd, &b) catch break;
-            if (n == 0) break;
-        }
+        while (true) _ = in.takeByte() catch break;
     } else if (std.mem.eql(u8, cmd, "clients")) {
         try out.print("ok\n{d}\n", .{s.clients.load(.acquire)});
     } else if (std.mem.eql(u8, cmd, "logs")) {

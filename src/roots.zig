@@ -108,7 +108,12 @@ pub fn unpackTar(arena: std.mem.Allocator, io: std.Io, cache: std.Io.Dir, name: 
     {
         var dest = try cache.openDir(io, tmp, .{});
         defer dest.close(io);
-        try std.tar.extract(io, dest, tar, .{ .mode_mode = .executable_bit_only });
+        // Windows: through layer.zig, which makes the root's symlinks
+        // without needing the right to.
+        if (builtin.os.tag == .windows)
+            try @import("layer.zig").apply(arena, io, dest, tar)
+        else
+            try std.tar.extract(io, dest, tar, .{ .mode_mode = .executable_bit_only });
     }
     cache.rename(tmp, cache, name, io) catch |err| {
         // Another process unpacked the same root first.

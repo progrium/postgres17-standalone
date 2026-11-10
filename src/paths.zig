@@ -7,13 +7,21 @@
 //!   logs        ~/.local/state/minipg/logs/<key>.log ~/Library/Logs/minipg/<key>.log
 //!   roots       ~/.cache/minipg/roots/<digest>/      ~/Library/Caches/minipg/roots/<digest>/
 //!
-//! <key> is a hash of the .pgdb directory's device and inode, so it
-//! follows the directory through renames. Linux falls back to
-//! ~/.cache/minipg/run/ without XDG_RUNTIME_DIR, and honors XDG_STATE_HOME
-//! and XDG_CACHE_HOME. Runtime directories are mode 0700.
+//!   what        Windows
+//!   runtime     %LOCALAPPDATA%\minipg\run\<key>\
+//!   logs        %LOCALAPPDATA%\minipg\logs\<key>.log
+//!   roots       %LOCALAPPDATA%\minipg\roots\<digest>\
+//!
+//! <key> is a hash of the .pgdb directory's device and inode (on Windows,
+//! its volume and file index), so it follows the directory through
+//! renames. Linux falls back to ~/.cache/minipg/run/ without
+//! XDG_RUNTIME_DIR, and honors XDG_STATE_HOME and XDG_CACHE_HOME. Runtime
+//! directories are mode 0700; on Windows, %LOCALAPPDATA% is already the
+//! user's own.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const sys = @import("sys.zig");
 
 const Environ = std.process.Environ;
 
@@ -30,7 +38,7 @@ pub const Dirs = struct {
     }
 
     pub fn logFor(d: Dirs, arena: std.mem.Allocator, k: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}/{s}.log", .{ d.logs, k });
+        return std.fmt.allocPrint(arena, "{s}{c}{s}.log", .{ d.logs, std.fs.path.sep, k });
     }
 };
 
@@ -39,7 +47,18 @@ fn get(env: *const Environ.Map, name: []const u8) ?[]const u8 {
     return if (v.len > 0) v else null;
 }
 
+/// What `dirs` needs and couldn't find, for the error message.
+pub const home_var = if (sys.is_windows) "LOCALAPPDATA" else "HOME";
+
 pub fn dirs(arena: std.mem.Allocator, env: *const Environ.Map) !Dirs {
+    if (sys.is_windows) {
+        const local = get(env, "LOCALAPPDATA") orelse return error.NoHomeDir;
+        return .{
+            .runtime = try std.fs.path.join(arena, &.{ local, "minipg", "run" }),
+            .logs = try std.fs.path.join(arena, &.{ local, "minipg", "logs" }),
+            .roots = try std.fs.path.join(arena, &.{ local, "minipg", "roots" }),
+        };
+    }
     const home = get(env, "HOME") orelse return error.NoHomeDir;
     if (builtin.os.tag == .macos) {
         const tmp = get(env, "TMPDIR") orelse "/tmp";
@@ -66,6 +85,11 @@ pub fn dirs(arena: std.mem.Allocator, env: *const Environ.Map) !Dirs {
 pub fn key(arena: std.mem.Allocator, dir: []const u8) ![]const u8 {
     const z = try arena.dupeZ(u8, dir);
     var h: std.hash.Wyhash = .init(0);
+    if (sys.is_windows) {
+        const id = try sys.fileId(arena, dir);
+        h.update(std.mem.asBytes(&id));
+        return std.fmt.allocPrint(arena, "{x:0>16}", .{h.final()});
+    }
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var st: linux.Statx = undefined;
@@ -87,17 +111,22 @@ pub fn key(arena: std.mem.Allocator, dir: []const u8) ![]const u8 {
 /// Creates `path` and its parents, and makes `path` itself mode 0700.
 pub fn makePrivateDir(io: std.Io, arena: std.mem.Allocator, path: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, path);
-    const z = try arena.dupeZ(u8, path);
-    _ = std.c.chmod(z, 0o700);
+    try chmod(arena, path, 0o700);
+}
+
+/// Sets a file's mode on POSIX; a no-op on Windows, which has none.
+pub fn chmod(arena: std.mem.Allocator, path: []const u8, mode: u32) !void {
+    if (sys.is_windows) return;
+    _ = std.c.chmod(try arena.dupeZ(u8, path), @intCast(mode));
 }
 
 /// Writes `data` to `path` through a temporary file and a rename, so
 /// readers see the old contents or the new, never part.
-pub fn writeAtomic(io: std.Io, arena: std.mem.Allocator, path: []const u8, data: []const u8, mode: std.c.mode_t) !void {
-    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp{d}", .{ path, std.c.getpid() });
+pub fn writeAtomic(io: std.Io, arena: std.mem.Allocator, path: []const u8, data: []const u8, mode: u32) !void {
+    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp{d}", .{ path, sys.pid() });
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(io, .{ .sub_path = tmp, .data = data });
-    _ = std.c.chmod(try arena.dupeZ(u8, tmp), mode);
+    try chmod(arena, tmp, mode);
     cwd.rename(tmp, cwd, path, io) catch |err| {
         cwd.deleteFile(io, tmp) catch {};
         return err;
@@ -107,7 +136,7 @@ pub fn writeAtomic(io: std.Io, arena: std.mem.Allocator, path: []const u8, data:
 test key {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const a = try key(arena.allocator(), "/");
+    const a = try key(arena.allocator(), ".");
     try std.testing.expectEqual(@as(usize, 16), a.len);
-    try std.testing.expectEqualStrings(a, try key(arena.allocator(), "/"));
+    try std.testing.expectEqualStrings(a, try key(arena.allocator(), "."));
 }

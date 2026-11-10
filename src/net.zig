@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const c = std.c;
+const sys = @import("sys.zig");
 
 /// The address to reach a server listening on `listen` (Postgres's
 /// listen_addresses) from this host: loopback for a wildcard or loopback
@@ -51,6 +52,7 @@ pub fn isLoopback(listen: []const u8) bool {
 }
 
 fn bindable(addr: std.Io.net.IpAddress) bool {
+    if (sys.is_windows) return bindableWindows(addr);
     var sa: c.sockaddr.in6 = undefined;
     var sa4: c.sockaddr.in = undefined;
     const fam: c_uint = switch (addr) {
@@ -81,6 +83,47 @@ fn bindable(addr: std.Io.net.IpAddress) bool {
     return rc == 0;
 }
 
+/// The same with Winsock. Without SO_REUSEADDR, which on Windows would let
+/// the bind take a port another socket holds.
+fn bindableWindows(addr: std.Io.net.IpAddress) bool {
+    const ws = struct {
+        const SOCKET = usize;
+        const INVALID_SOCKET: SOCKET = ~@as(SOCKET, 0);
+        const WSADATA = extern struct { data: [408]u8 };
+        extern "ws2_32" fn WSAStartup(version: u16, data: *WSADATA) callconv(.winapi) i32;
+        extern "ws2_32" fn socket(af: i32, kind: i32, proto: i32) callconv(.winapi) SOCKET;
+        extern "ws2_32" fn bind(s: SOCKET, name: *const anyopaque, len: i32) callconv(.winapi) i32;
+        extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
+    };
+    const AF_INET = 2;
+    const AF_INET6 = 23;
+    const SOCK_STREAM = 1;
+    var data: ws.WSADATA = undefined;
+    // Counted: Winsock stays up for std's sockets after this.
+    if (ws.WSAStartup(0x0202, &data) != 0) return false;
+    const fd = ws.socket(if (addr == .ip4) AF_INET else AF_INET6, SOCK_STREAM, 0);
+    if (fd == ws.INVALID_SOCKET) return false;
+    defer _ = ws.closesocket(fd);
+    // sockaddr_in and sockaddr_in6 have the same layout as on POSIX.
+    var sa4 = std.mem.zeroes(extern struct { family: u16, port: u16, addr: [4]u8, zero: [8]u8 });
+    var sa6 = std.mem.zeroes(extern struct { family: u16, port: u16, flowinfo: u32, addr: [16]u8, scope_id: u32 });
+    const rc = switch (addr) {
+        .ip4 => |a| blk: {
+            sa4.family = AF_INET;
+            sa4.port = std.mem.nativeToBig(u16, a.port);
+            sa4.addr = a.bytes;
+            break :blk ws.bind(fd, &sa4, @sizeOf(@TypeOf(sa4)));
+        },
+        .ip6 => |a| blk: {
+            sa6.family = AF_INET6;
+            sa6.port = std.mem.nativeToBig(u16, a.port);
+            sa6.addr = a.bytes;
+            break :blk ws.bind(fd, &sa6, @sizeOf(@TypeOf(sa6)));
+        },
+    };
+    return rc == 0;
+}
+
 /// Whether Postgres could bind `port` on `listen`'s first address.
 pub fn portFree(listen: []const u8, port: u16) bool {
     const first = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, listen, ',')) |i| listen[0..i] else listen, " ");
@@ -92,7 +135,7 @@ pub fn portFree(listen: []const u8, port: u16) bool {
 /// A free port on loopback and on all interfaces, chosen at random from
 /// 54320-54999 so URLs look like Postgres's.
 pub fn freePort() !u16 {
-    var seed: u64 = @intCast(@as(u64, @bitCast(@as(i64, c.getpid()))) *% 2654435761);
+    var seed: u64 = @intCast(@as(u64, @bitCast(@as(i64, sys.pid()))) *% 2654435761);
     var i: u32 = 0;
     while (i < 64) : (i += 1) {
         seed = seed *% 6364136223846793005 +% 1442695040888963407;

@@ -13,6 +13,7 @@ const h9 = @import("h9");
 const native = @import("build_options").native;
 const host = @import("host.zig");
 const root_mod = @import("roots.zig");
+const sys = @import("sys.zig");
 
 /// The .pgdb directory as the server sees it: the machine's cwd, or in the
 /// Linux build the directory itself.
@@ -101,8 +102,8 @@ pub fn runServer(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r
 fn runServerMachine(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, r: ServerRun) RunResult {
     const opts: h9.Machine.Options = .{
         .backend = backend(),
-        .linux_root = r.root.dir,
-        .cwd = r.pgdb,
+        .linux_root = sys.kernPath(arena, r.root.dir) catch r.root.dir,
+        .cwd = sys.kernPath(arena, r.pgdb) catch r.pgdb,
         .env = r.env,
         .guest_tools = false,
         .builtin = .off,
@@ -162,11 +163,15 @@ fn runToolMachine(gpa: std.mem.Allocator, io: std.Io, env_map: *const std.proces
     defer env.deinit(gpa);
     try env.appendSlice(gpa, r.env);
     if (tty) try env.append(gpa, .{ .name = "TERM", .value = env_map.get("TERM") orelse "xterm" });
+    if (tty) terminal.enableVt();
+
+    var path_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer path_arena.deinit();
 
     const opts: h9.Machine.Options = .{
         .backend = backend(),
-        .linux_root = r.root.dir,
-        .cwd = r.cwd,
+        .linux_root = try sys.kernPath(path_arena.allocator(), r.root.dir),
+        .cwd = try sys.kernPath(path_arena.allocator(), r.cwd),
         .env = env.items,
         .guest_tools = false,
         .builtin = .off,

@@ -1,27 +1,33 @@
 NAME			?= minipg
 VERSION			?= dev
-HOST_OS			:= $(shell uname -s | tr A-Z a-z | sed 's/darwin/macos/')
+HOST_OS			:= $(shell uname -s | tr A-Z a-z | sed 's/darwin/macos/; s/^mingw.*/windows/; s/^msys.*/windows/; s/^cygwin.*/windows/')
 HOST_ARCH		:= $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 OS				?= $(HOST_OS)
 ARCH			?= $(HOST_ARCH)
 OPTIMIZE		?= ReleaseSafe
-OUT				?= $(NAME)
+# Windows binaries end in .exe.
+exe				= $(if $(filter windows,$(1)),.exe)
+OUT				?= $(NAME)$(call exe,$(OS))
 # The Postgres major the binary embeds.
 PG_MAJOR		?= 18
 DIST_DIR		?= dist
-DIST_TARGETS	?= linux_amd64 linux_arm64 macos_arm64
+DIST_TARGETS	?= linux_amd64 linux_arm64 macos_arm64 windows_amd64
 
 ZIG_ARCH_amd64	:= x86_64
 ZIG_ARCH_arm64	:= aarch64
 # Linux builds are static musl binaries, so one runs on any distro, Alpine
-# included.
-zig_target		= $(ZIG_ARCH_$(2))-$(if $(filter macos,$(1)),macos,linux-musl)
+# included. Windows builds need Windows 10 1803 or later (build.zig).
+zig_os_linux	:= linux-musl
+zig_os_macos	:= macos
+zig_os_windows	:= windows
+zig_target		= $(ZIG_ARCH_$(2))-$(zig_os_$(1))
 
-## Build ./minipg for OS (linux, macos) and ARCH (amd64, arm64)
+## Build ./minipg for OS (linux, macos, windows) and ARCH (amd64, arm64;
+## Windows is amd64 only)
 build: assets/root-$(ARCH).tar.xz
 	zig build -Doptimize=$(OPTIMIZE) -Dtarget=$(call zig_target,$(OS),$(ARCH)) -Dversion=$(VERSION) \
 		-p .zig-out/$(OS)_$(ARCH)
-	cp .zig-out/$(OS)_$(ARCH)/bin/$(NAME) $(OUT)
+	cp .zig-out/$(OS)_$(ARCH)/bin/$(NAME)$(call exe,$(OS)) $(OUT)
 .PHONY: build
 
 ## Pull and trim the postgres:PG_MAJOR-alpine root for ARCH (assets/root-ARCH.tar.xz and .json)
@@ -57,7 +63,7 @@ web: assets/root-386.tar.xz
 
 ## Clean build outputs
 clean:
-	rm -rf $(DIST_DIR) .zig-out zig-out .zig-cache $(NAME)
+	rm -rf $(DIST_DIR) .zig-out zig-out .zig-cache $(NAME) $(NAME).exe
 .PHONY: clean
 
 ## Build distribution zips (dist/minipg_VERSION_OS_ARCH.zip)
@@ -66,9 +72,10 @@ dist: $(foreach t,$(DIST_TARGETS),$(DIST_DIR)/$(NAME)_$(VERSION)_$(t).zip)
 
 $(DIST_DIR)/$(NAME)_$(VERSION)_%.zip:
 	mkdir -p $(DIST_DIR)/$*
-	$(MAKE) build OS=$(word 1,$(subst _, ,$*)) ARCH=$(word 2,$(subst _, ,$*)) OUT=$(DIST_DIR)/$*/$(NAME)
+	$(MAKE) build OS=$(word 1,$(subst _, ,$*)) ARCH=$(word 2,$(subst _, ,$*)) \
+		OUT=$(DIST_DIR)/$*/$(NAME)$(call exe,$(word 1,$(subst _, ,$*)))
 	rm -f $@
-	zip -j $@ $(DIST_DIR)/$*/$(NAME)
+	zip -j $@ $(DIST_DIR)/$*/$(NAME)$(call exe,$(word 1,$(subst _, ,$*)))
 	rm -rf $(DIST_DIR)/$*
 
 .DEFAULT_GOAL := show-help

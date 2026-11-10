@@ -42,15 +42,18 @@ minipg makes four promises:
 
 ## 2. Installing
 
-Download the zip for your platform from the releases page, unzip it, and put `minipg` somewhere on your `PATH`. Release zips are named `minipg_<version>_<os>_<arch>.zip`.
+Download the zip for your platform from the releases page, unzip it, and put `minipg` (`minipg.exe` on Windows) somewhere on your `PATH`. Release zips are named `minipg_<version>_<os>_<arch>.zip`.
 
 | Platform | h9 backend | Needs | Tested |
 |---|---|---|---|
 | Linux x86_64 | KVM, or h9's native backend without it | Linux 5.11 or later | Yes, on the native backend |
 | Linux arm64 | KVM | Read and write access to `/dev/kvm` | Builds; not run |
 | macOS (Apple Silicon) | Hypervisor.framework | The hypervisor entitlement (release builds are signed ad hoc with it) | Builds; not run |
+| Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature turned on | Yes, on WHP |
 
-Linux builds are static musl binaries, so the same binary runs on glibc distros, Alpine, and minimal container images. Intel Macs and Windows aren't supported yet.
+Linux builds are static musl binaries, so the same binary runs on glibc distros, Alpine, and minimal container images. Intel Macs and Windows on ARM aren't supported yet. (h9 has no WHP backend for arm64 yet, and minipg leaves out h9's emulator, which is GPL-licensed.)
+
+**On Windows,** turn on the Windows Hypervisor Platform in Settings > System > Optional features > More Windows features, or run `DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform` as an administrator, then restart. Without it, minipg says the hypervisor is unavailable. Run minipg from PowerShell, Windows Terminal, or `cmd`; the examples in this manual use POSIX shell syntax, and translate directly.
 
 On macOS, a binary downloaded with a browser may be quarantined by Gatekeeper. If macOS refuses to run it, clear the quarantine attribute with `xattr -d com.apple.quarantine ./minipg`.
 
@@ -199,6 +202,12 @@ minipg run app.pgdb -d test -- pytest
 eval "$(minipg env app.pgdb)"
 ```
 
+On Windows, it prints PowerShell assignments instead:
+
+```powershell
+minipg env app.pgdb | Invoke-Expression
+```
+
 **`url`** prints just the URL, for a config file or a `.env`:
 
 ```sh
@@ -294,7 +303,7 @@ minipg serve app.pgdb [-p PORT] [--listen ADDR] [--log FILE] [--trust] [--idle S
 
 **`--trust`.** minipg writes a temporary access file that trusts connections from `127.0.0.1` and `::1`, and removes it when the server stops. `--trust` is refused with a non-loopback `--listen`, because it would let anyone who can reach the port in without a password.
 
-**Stopping.** Ctrl-C, SIGTERM, and `minipg stop` all ask Postgres for a fast shutdown: open transactions are rolled back, clients are disconnected, and Postgres writes a checkpoint before exiting. A second Ctrl-C, or 30 seconds without an exit, tears the machine down at once; Postgres then recovers from its write-ahead log (WAL) on the next start, with no committed data lost.
+**Stopping.** Ctrl-C, SIGTERM, and `minipg stop` all ask Postgres for a fast shutdown (on Windows: Ctrl-C, Ctrl-Break, closing the console, logging off, and shutting down): open transactions are rolled back, clients are disconnected, and Postgres writes a checkpoint before exiting. A second Ctrl-C, or 30 seconds without an exit, tears the machine down at once; Postgres then recovers from its write-ahead log (WAL) on the next start, with no committed data lost.
 
 **Under a supervisor.** `serve` is a normal foreground process, which suits systemd, launchd, a Procfile, or a container's entrypoint. A systemd unit can be as small as this:
 
@@ -466,6 +475,8 @@ KVM (on Linux) and Hypervisor.framework (on macOS) avoid the native backend's ma
 
 ## 12. Troubleshooting
 
+**"cannot create a machine: ... no usable hypervisor".** On Windows, turn on the Windows Hypervisor Platform feature (see [Installing](#2-installing)). On Linux without KVM, minipg uses h9's native backend, which needs Linux 5.11 or later.
+
 **"waiting for the server for app.pgdb to start..."** The first start unpacks the root and runs initdb, which can take several seconds, longer on a slow disk. Later starts take about 2 seconds. If it never finishes, minipg prints the end of the server's log.
 
 **"the server for app.pgdb failed to start".** minipg prints the last lines of the log. Common causes are a port pinned with `-p` that's taken, a bad `-c` setting passed to `serve`, or a cluster left half-initialized by an interrupted `init`. `minipg logs app.pgdb` shows the full last log.
@@ -524,7 +535,7 @@ Prints a `postgres://user:password@host:port/database` URL, with the running ser
 
 #### `env <pgdb> [-d DB]`
 
-Prints `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE` as shell-quoted `export` lines. Doesn't start a server. **Creates.**
+Prints `DATABASE_URL`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, and `PGDATABASE` as shell-quoted `export` lines, or on Windows as PowerShell `$env:NAME = 'value'` lines. Doesn't start a server. **Creates.**
 
 #### `run <pgdb> [-d DB] -- CMD [args]`
 
@@ -607,7 +618,7 @@ Print minipg's version, or the usage summary.
 
 **Network,** for root downloads: `HTTPS_PROXY`, `NO_PROXY`, and `SSL_CERT_FILE`.
 
-**Paths,** on Linux: `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME`, as in [Files outside the .pgdb](#134-files-outside-the-pgdb). On macOS, `TMPDIR`. `HOME` must be set on both.
+**Paths,** on Linux: `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME`, as in [Files outside the .pgdb](#134-files-outside-the-pgdb). On macOS, `TMPDIR`. `HOME` must be set on both. On Windows, `LOCALAPPDATA` must be set (it always is), and `restore` spools a dump from stdin under `TEMP`.
 
 ### 13.3 minipg.toml
 
@@ -630,13 +641,15 @@ Print minipg's version, or the usage summary.
 
 The `.pgdb` holds only data and settings. Runtime state, logs, and unpacked roots live in per-user directories:
 
-| What | Linux | macOS |
-|---|---|---|
-| Runtime (`run.json`, control socket) | `$XDG_RUNTIME_DIR/minipg/<key>/` | `$TMPDIR/minipg-$UID/<key>/` |
-| Logs | `~/.local/state/minipg/logs/<key>.log` | `~/Library/Logs/minipg/<key>.log` |
-| Unpacked roots | `~/.cache/minipg/roots/<digest>/` | `~/Library/Caches/minipg/roots/<digest>/` |
+| What | Linux | macOS | Windows |
+|---|---|---|---|
+| Runtime (`run.json`, control socket) | `$XDG_RUNTIME_DIR/minipg/<key>/` | `$TMPDIR/minipg-$UID/<key>/` | `%LOCALAPPDATA%\minipg\run\<key>\` |
+| Logs | `~/.local/state/minipg/logs/<key>.log` | `~/Library/Logs/minipg/<key>.log` | `%LOCALAPPDATA%\minipg\logs\<key>.log` |
+| Unpacked roots | `~/.cache/minipg/roots/<digest>/` | `~/Library/Caches/minipg/roots/<digest>/` | `%LOCALAPPDATA%\minipg\roots\<digest>\` |
 
-`<key>` is a hash of the `.pgdb` directory's device and inode, so it follows the directory, not its name. On Linux, the runtime directory falls back to `~/.cache/minipg/run/` when `XDG_RUNTIME_DIR` isn't set, and `XDG_STATE_HOME` and `XDG_CACHE_HOME` replace `~/.local/state` and `~/.cache`. Runtime directories are mode 0700.
+`<key>` is a hash of the `.pgdb` directory's device and inode (on Windows, its volume serial number and file index), so it follows the directory, not its name. On Linux, the runtime directory falls back to `~/.cache/minipg/run/` when `XDG_RUNTIME_DIR` isn't set, and `XDG_STATE_HOME` and `XDG_CACHE_HOME` replace `~/.local/state` and `~/.cache`. Runtime directories are mode 0700; on Windows, `%LOCALAPPDATA%` is already private to your account.
+
+On Windows, which lets only administrators (or Developer Mode) make symlinks, the root's symlinks unpack as hard links to their targets, and its few directory links as copies. On Windows, each server also commits its whole 2 GB of guest memory up front (1 GB for each running tool), so an 8 GB machine runs three or four servers at once.
 
 Everything here can be deleted while no server runs. Roots unpack again and logs start over.
 
@@ -656,10 +669,10 @@ Everything here can be deleted while no server runs. Roots unpack again and logs
 
 A short tour, for the curious. The README's "How it works" section and the source have the details.
 
-- **h9.** hyper9 is a Plan 9 kernel that runs as a library inside minipg. Its Linux personality runs unmodified Linux binaries (here, Alpine's Postgres) on the host's hypervisor, answering their system calls itself. On x86_64 Linux without KVM, its native backend runs each guest process as a host process and intercepts its system calls instead.
+- **h9.** hyper9 is a Plan 9 kernel that runs as a library inside minipg. Its Linux personality runs unmodified Linux binaries (here, Alpine's Postgres) on the host's hypervisor, answering their system calls itself. On x86_64 Linux without KVM, its native backend runs each guest process as a host process and intercepts its system calls instead. On Windows, the hypervisor is the Windows Hypervisor Platform.
 - **The server process** ([src/server.zig](src/server.zig)) holds the lock, picks the port, writes `run.json`, serves the control socket, and runs Postgres in an h9 machine. The machine's root is the unpacked Alpine image, and its writable working directory is the `.pgdb`. The image's own `docker-entrypoint.sh` initializes a new cluster. A monitor thread logs in to see when Postgres is ready, then counts clients in `pg_stat_activity` for `status` and the idle timeout.
 - **Shutdown** goes through a small supervisor shell in the machine, which sends SIGINT (a fast shutdown) to the postmaster alone.
-- **The control socket** ([src/control.zig](src/control.zig)) is a unix socket with a one-line, versioned request protocol: `status`, `stop`, `logs`, and `clients`.
+- **The control socket** ([src/control.zig](src/control.zig)) is a unix socket (AF_UNIX on Windows too) with a one-line, versioned request protocol: `status`, `stop`, `logs`, and `clients`.
 - **Clients** ([src/client.zig](src/client.zig)) find a running server or start one. **Tool machines** ([src/vm.zig](src/vm.zig)) run psql and the other tools over the same root.
 
 ## Appendix B: Building from source
@@ -669,14 +682,15 @@ Building needs [Zig 0.16](https://ziglang.org/download/), and `curl`, `jq`, `tar
 ```sh
 git submodule update --init
 make build                       # pulls the root for this host's arch, builds ./minipg
-make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos; ARCH: amd64, arm64)
+make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos, windows; ARCH: amd64, arm64)
+make build OS=windows ARCH=amd64 # ./minipg.exe
 make build PG_MAJOR=17           # embed another major
 make test                        # unit tests
 make e2e                         # end-to-end tests against ./minipg
 make stress                      # the stress suite (slow; STRESS_ROUNDS, STRESS_SOAK)
 ```
 
-macOS builds have to be made on a Mac, for the SDK's Hypervisor framework. See the README's [Building](README.md#building) section for more.
+macOS builds have to be made on a Mac, for the SDK's Hypervisor framework. Windows builds cross-compile from Linux or macOS, and build on Windows too, with root.sh run from Git Bash or MSYS2. See the README's [Building](README.md#building) section for more.
 
 ## Appendix C: Roadmap
 
@@ -687,5 +701,5 @@ Planned, but not in minipg yet:
 - `psql` and `pg_dump` as symlinks to minipg (multicall)
 - A macOS package declaration, so Finder shows a `.pgdb` as one file
 - A single-file `.pgdb`
-- Windows, once h9's backend for it matures
+- Windows on ARM, once h9 has a WHP backend for arm64
 - Homebrew, apt, and other platform packages

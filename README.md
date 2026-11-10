@@ -48,7 +48,7 @@ Every command takes the `.pgdb` first; a bare path is shorthand for `shell`. `-d
 | `url <pgdb>` | A `postgres://` URL with the password |
 | `logs <pgdb> [-f]` | The server's recent log (a 4 MB window), or the last server's log file |
 | `exec <pgdb> -- TOOL [args]` | Run a Postgres tool (pg_dump, pg_restore, psql, ...) against the server, with `PG*` set |
-| `env <pgdb>` | `DATABASE_URL` and `PG*` as shell exports: `eval "$(minipg env app.pgdb)"` |
+| `env <pgdb>` | `DATABASE_URL` and `PG*` as shell exports: `eval "$(minipg env app.pgdb)"`; on Windows, PowerShell assignments: `minipg env app.pgdb \| Invoke-Expression` |
 | `run <pgdb> -- CMD [args]` | Run a host command with `DATABASE_URL` and `PG*` set; the server stays up until it exits, and its exit code is minipg's |
 | `dump <pgdb> [pg_dump args]` | `pg_dump` to stdout (plain SQL unless args say otherwise) |
 | `restore <pgdb> [FILE]` | Restore a plain SQL or custom-format dump from FILE or stdin; stops at the first error |
@@ -76,13 +76,13 @@ psql, pg_dump, and the other tools run in their own short-lived h9 machine (abou
 
 ### Files outside the .pgdb
 
-| What | Linux | macOS |
-|---|---|---|
-| Runtime (run.json, control socket) | `$XDG_RUNTIME_DIR/minipg/<key>/` | `$TMPDIR/minipg-$UID/<key>/` |
-| Logs | `~/.local/state/minipg/logs/<key>.log` | `~/Library/Logs/minipg/<key>.log` |
-| Unpacked roots | `~/.cache/minipg/roots/<digest>/` | `~/Library/Caches/minipg/roots/<digest>/` |
+| What | Linux | macOS | Windows |
+|---|---|---|---|
+| Runtime (run.json, control socket) | `$XDG_RUNTIME_DIR/minipg/<key>/` | `$TMPDIR/minipg-$UID/<key>/` | `%LOCALAPPDATA%\minipg\run\<key>\` |
+| Logs | `~/.local/state/minipg/logs/<key>.log` | `~/Library/Logs/minipg/<key>.log` | `%LOCALAPPDATA%\minipg\logs\<key>.log` |
+| Unpacked roots | `~/.cache/minipg/roots/<digest>/` | `~/Library/Caches/minipg/roots/<digest>/` | `%LOCALAPPDATA%\minipg\roots\<digest>\` |
 
-`<key>` is a hash of the `.pgdb` directory's device and inode. Linux falls back to `~/.cache/minipg/run/` without `XDG_RUNTIME_DIR`, and honors `XDG_STATE_HOME` and `XDG_CACHE_HOME`. The first run unpacks the embedded root (about 90 MB, a few seconds).
+`<key>` is a hash of the `.pgdb` directory's device and inode (on Windows, its volume and file index). Linux falls back to `~/.cache/minipg/run/` without `XDG_RUNTIME_DIR`, and honors `XDG_STATE_HOME` and `XDG_CACHE_HOME`. The first run unpacks the embedded root (about 90 MB, a few seconds).
 
 ## Platforms
 
@@ -91,8 +91,11 @@ psql, pg_dump, and the other tools run in their own short-lived h9 machine (abou
 | Linux x86_64 | KVM, or h9's native backend without it | Linux 5.11 or later | Yes, native backend |
 | Linux arm64 | KVM | read/write `/dev/kvm` | Builds; not run |
 | macOS (Apple Silicon) | Hypervisor.framework | the hypervisor entitlement (the build signs ad hoc) | Not run |
+| Windows x86_64 | Windows Hypervisor Platform (WHP) | Windows 10 1803 or later, with the Windows Hypervisor Platform feature on | Yes, on WHP |
 
-Linux builds are static musl binaries, so one runs on glibc distros and Alpine alike.
+Linux builds are static musl binaries, so one runs on glibc distros and Alpine alike. Windows on ARM isn't supported yet: h9 has no WHP backend for arm64, and minipg leaves out h9's emulator, which is GPL-licensed.
+
+On Windows, turn the feature on in Settings > System > Optional features > More Windows features ("Windows Hypervisor Platform"), or with `DISM /Online /Enable-Feature /FeatureName:HypervisorPlatform` as an administrator, then restart.
 
 ## In containers and CI
 
@@ -107,7 +110,7 @@ minipg run test.pgdb -- go test ./...
 
 - [src/server.zig](src/server.zig) is the server process. It holds the `.pgdb`'s lock, picks the port, writes `run.json`, serves the control socket, and runs Postgres in an h9 machine whose Linux root is the unpacked image and whose writable cwd is the `.pgdb` (`/mnt/term/cwd` in the guest). The image's `docker-entrypoint.sh` initializes the cluster on first start. A monitor thread logs in to see when Postgres is ready, then counts clients in `pg_stat_activity` for `status` and the idle timeout.
 - To stop, the server tells a small supervisor shell in the machine, which sends SIGINT (a fast shutdown) to the postmaster alone. h9's interrupt note would reach every process in the machine, and Postgres's children act on SIGINT themselves, which can leave the postmaster waiting forever. A second Ctrl-C, or 30 seconds, tears the machine down; Postgres recovers from its WAL on the next start.
-- [src/control.zig](src/control.zig) is the control protocol: one versioned request line over a unix socket (`status`, `stop`, `logs [follow]`, `clients`).
+- [src/control.zig](src/control.zig) is the control protocol: one versioned request line over a unix socket, AF_UNIX on Windows too (`status`, `stop`, `logs [follow]`, `clients`).
 - [src/client.zig](src/client.zig) finds a running server or starts one; [src/vm.zig](src/vm.zig) builds the server and tool machines; [src/pgwire.zig](src/pgwire.zig) is the small Postgres client (SCRAM-SHA-256, simple queries) the server uses on the host.
 
 ## Building
@@ -117,13 +120,14 @@ Requires [Zig 0.16](https://ziglang.org/download/), and for the root `curl`, `jq
 ```sh
 git submodule update --init
 make build                       # pulls the root for this host's arch, builds ./minipg
-make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos; ARCH: amd64, arm64)
+make build OS=linux ARCH=arm64   # cross-compile (OS: linux, macos, windows; ARCH: amd64, arm64)
+make build OS=windows ARCH=amd64 # ./minipg.exe
 make root ARCH=arm64             # just assets/root-arm64.tar.xz and .json
 make build PG_MAJOR=17           # embed another major
 make dist VERSION=v0.4           # dist/minipg_v0.4_<os>_<arch>.zip
 ```
 
-[scripts/root.sh](scripts/root.sh) pulls the image from Docker Hub's registry, drops what a server doesn't need (LLVM for JIT, headers, docs), and records the image's digest, version, and ENV beside the tarball. JIT is therefore unavailable, and minipg sets `jit=off`. macOS builds have to be made on a Mac (for the SDK's Hypervisor framework).
+[scripts/root.sh](scripts/root.sh) pulls the image from Docker Hub's registry, drops what a server doesn't need (LLVM for JIT, headers, docs), and records the image's digest, version, and ENV beside the tarball. JIT is therefore unavailable, and minipg sets `jit=off`. macOS builds have to be made on a Mac (for the SDK's Hypervisor framework). Windows builds cross-compile from anywhere; on Windows itself, run root.sh from Git Bash or MSYS2.
 
 ## Testing
 
@@ -139,6 +143,8 @@ make stress   # the slow stress suite: kill -9 mid-write, soak, limits, recovery
 - **Killed servers.** On the native backend each Postgres process is its own host process. If the server process is killed outright (SIGKILL, OOM), they live on for a few seconds before exiting, and the `.pgdb` stays locked until they do; minipg waits for that. Postgres recovers from its WAL on the next start.
 - **pg_restore from a pipe.** pg_restore misreads a custom-format archive on stdin inside h9, so `minipg restore` spools stdin to a temp file first.
 - **Cross-arch.** A `.pgdb` records the arch it was created on, and the server warns when it's opened on another.
+- **Windows roots.** Windows lets only administrators (or Developer Mode) make symlinks, so on Windows the root's symlinks are unpacked as hard links to their targets, and its few directory links as copies.
+- **Windows memory.** WHP commits a machine's whole guest memory up front: 2 GB for each server and 1 GB for each running tool. On an 8 GB machine, three or four servers at once is the limit, and the page file grows with them.
 
 ## License
 

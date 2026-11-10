@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -178,8 +177,7 @@ func TestCrashRecovery(t *testing.T) {
 	e.must("init", "app.pgdb")
 	e.query("app.pgdb", "create extension amcheck; create table t (id int primary key, s text); insert into t select g, repeat('x', 200) from generate_series(1, 20000) g")
 	pid := int(runJSON(t, e, "app.pgdb")["pid"].(float64))
-	// The background server leads its own process group.
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+	if err := killServer(pid); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
 	waitFor(t, "the lock to be released", 15*time.Second, func() bool { return !e.status("app.pgdb").running })

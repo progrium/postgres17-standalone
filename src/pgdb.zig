@@ -94,7 +94,7 @@ pub fn create(arena: std.mem.Allocator, io: std.Io, path: []const u8, c: Config)
     if (cwd.access(io, path, .{})) |_| return error.PathAlreadyExists else |_| {}
     try cwd.createDir(io, path, .default_dir);
     errdefer cwd.deleteTree(io, path) catch {};
-    _ = std.c.chmod(try arena.dupeZ(u8, path), 0o700);
+    try paths.chmod(arena, path, 0o700);
     const p: Pgdb = .{ .path = try cwd.realPathFileAlloc(io, path, arena), .config = c };
     try p.save(arena, io);
     return p;
