@@ -100,7 +100,7 @@ pub fn create(arena: std.mem.Allocator, io: std.Io, path: []const u8, c: Config)
     return p;
 }
 
-/// The default database name for a .pgdb path: its file name without the
+/// The default database name for a .pgdb path: its base name without the
 /// extension (app.pgdb is "app").
 pub fn defaultDatabase(path: []const u8) []const u8 {
     const base = std.fs.path.basename(std.mem.trimEnd(u8, path, "/"));

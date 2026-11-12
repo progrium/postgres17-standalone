@@ -1,4 +1,4 @@
-//! minipg: PostgreSQL as a file.
+//! minipg: PostgreSQL as a single executable.
 //!
 //! A .pgdb directory is the database; `minipg app.pgdb` opens a psql shell
 //! on it. minipg embeds Docker Hub's postgres:<major>-alpine image as a
