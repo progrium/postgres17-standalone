@@ -6,7 +6,7 @@
 const std = @import("std");
 
 pub const usage =
-    \\minipg: PostgreSQL as a file
+    \\minipg: PostgreSQL as a single executable
     \\
     \\Usage:
     \\  minipg <pgdb> [sql]                    psql on the .pgdb (created if missing), or run one statement

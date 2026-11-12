@@ -2,7 +2,7 @@
 export PSQL_PAGER= PS1='\[\e[1;34m\]\w\[\e[0m\] \$ '
 cd /root
 cat <<'MSG'
-minipg: PostgreSQL as a file. This is minipg with Postgres 18 for 386
+minipg: PostgreSQL as a single executable. This is minipg with Postgres 18 for 386
 Linux, running in your browser under h9.
 
 Try:

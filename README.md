@@ -1,6 +1,6 @@
 # minipg
 
-PostgreSQL as a file. One binary, nothing to install or configure: a `.pgdb` is the database, and `minipg app.pgdb` opens a shell on it.
+PostgreSQL as a single executable. No install, no Docker, and a `.pgdb` folder that holds the whole database: `minipg app.pgdb` opens a shell on it.
 
 ```sh
 minipg app.pgdb                          # psql shell (creates app.pgdb if missing)
@@ -30,7 +30,7 @@ app.pgdb/
 
 Data, config, credentials, and the Postgres version live inside it; nothing is written next to it. A stopped `.pgdb` can be copied like any directory. While a server runs, use `pg_dump` (`minipg exec app.pgdb -- pg_dump`), since a raw copy isn't guaranteed consistent.
 
-`minipg.toml` records the layout `format`, the Postgres major, variant (alpine), arch, and image digest, the superuser and its generated password, the default database (named after the file: `app.pgdb` has `app`), and the preferred port, picked at init.
+`minipg.toml` records the layout `format`, the Postgres major, variant (alpine), arch, and image digest, the superuser and its generated password, the default database (named after the `.pgdb`: `app.pgdb` has `app`), and the preferred port, picked at init.
 
 New clusters use Postgres's builtin `C.UTF-8` locale, which sorts the same on every platform and never changes between versions, so indexes on text can't be invalidated by a libc update.
 

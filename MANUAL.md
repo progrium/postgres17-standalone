@@ -25,7 +25,7 @@ This is the long-form guide to minipg. The [README](README.md) is the short vers
 
 ## 1. Introduction
 
-minipg gives PostgreSQL the workflow of SQLite. It's one binary with nothing to install or configure, and a `.pgdb` is the database: `minipg app.pgdb` creates it if needed, starts Postgres, and opens a psql shell on it.
+minipg gives PostgreSQL the workflow of SQLite. It's PostgreSQL as a single executable: no install, no Docker, and a `.pgdb` folder that holds the whole database. `minipg app.pgdb` creates it if needed, starts Postgres, and opens a psql shell on it.
 
 Under the hood, minipg embeds Docker Hub's official `postgres:18-alpine` image and runs Alpine's own Postgres binaries with [hyper9](https://github.com/progrium/hyper9) (h9). h9's Linux personality executes them directly on the host's hypervisor, with h9's Plan 9 kernel answering their system calls. There's no Linux kernel to boot, no VM image, and no Docker.
 
@@ -123,7 +123,7 @@ minipg treats a directory as a `.pgdb` when it contains `minipg.toml`. The `.pgd
 
 `minipg.toml` records the layout format, the Postgres major, variant (always `alpine`), architecture, and image digest the cluster was created with, the superuser and its password, the default database, and the preferred port. Every key is described in [minipg.toml](#133-minipgtoml).
 
-The **default database** is named after the file: `app.pgdb` gets a database called `app`, and `/data/orders.pgdb` gets `orders`. Commands connect to the default database unless you pass `-d DB`, and `minipg default` changes which one is the default.
+The **default database** is named after the `.pgdb`: `app.pgdb` gets a database called `app`, and `/data/orders.pgdb` gets `orders`. Commands connect to the default database unless you pass `-d DB`, and `minipg default` changes which one is the default.
 
 Plain files grow and shrink with the host filesystem, so there's nothing to size or resize.
 
@@ -515,7 +515,7 @@ Opens psql on the `.pgdb`, or runs each SQL argument as a statement. With a `pos
 
 #### `init <pgdb> [--port N] [--user U] [--pg MAJOR]`
 
-Creates a `.pgdb` and initializes its cluster, then prints `created <path> (Postgres <version>, database <name>)`. Refuses if the path exists. `--port` sets the preferred port (default: a free one), `--user` the superuser's name (default `POSTGRES_USER`, else `postgres`), and `--pg` the Postgres major (default: the embedded one). The password comes from `POSTGRES_PASSWORD` or is generated, and the default database from `POSTGRES_DB` or the file name. If initialization fails, the `.pgdb` is removed and the end of the log is printed.
+Creates a `.pgdb` and initializes its cluster, then prints `created <path> (Postgres <version>, database <name>)`. Refuses if the path exists. `--port` sets the preferred port (default: a free one), `--user` the superuser's name (default `POSTGRES_USER`, else `postgres`), and `--pg` the Postgres major (default: the embedded one). The password comes from `POSTGRES_PASSWORD` or is generated, and the default database from `POSTGRES_DB` or the `.pgdb` name. If initialization fails, the `.pgdb` is removed and the end of the log is printed.
 
 #### `serve <pgdb> [-p PORT] [--listen ADDR] [--log FILE] [--trust] [--idle SECONDS] [-- postgres args]`
 
@@ -609,7 +609,7 @@ Print minipg's version, or the usage summary.
 |---|---|
 | `POSTGRES_USER` | Superuser name. Default `postgres`. `--user` overrides it. |
 | `POSTGRES_PASSWORD` | Superuser password. Default: generated. Also read by `passwd`. |
-| `POSTGRES_DB` | Default database name. Default: the file name without `.pgdb`. |
+| `POSTGRES_DB` | Default database name. Default: the `.pgdb` name without the extension. |
 | `POSTGRES_INITDB_ARGS` | Extra arguments for initdb, such as `--locale` or `--data-checksums`. Passing `--auth` or a locale option replaces minipg's own defaults for those. |
 | `POSTGRES_INITDB_WALDIR` | A separate WAL directory, as a path inside the machine. |
 | `TZ` | Time zone for the server, passed through on every start. |
